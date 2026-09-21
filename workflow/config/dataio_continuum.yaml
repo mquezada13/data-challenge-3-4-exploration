@@ -1,7 +1,7 @@
 data_file: /Users/maura/Documents/COSI/data-challenge-4/workflow/data/inputs/dc4_mock_dataset_week_1_unbinned_data_filtered_with_SAAcut.fits.gz
 ori_file: /Users/maura/Documents/COSI/data-challenge-4/workflow/data/inputs/DC4_final_530km_3_month_with_slew_15sbins_GalacticEarth_SAA.fits
 unbinned_output: fits
-time_bins: 7979954.851480961
+time_bins: 3600.0
 energy_bins:
 - 100.0
 - 158.489
