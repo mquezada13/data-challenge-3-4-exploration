@@ -4,6 +4,7 @@
 # Data and generated outputs
 data/
 outputs/
+plot_outputs
 
 # Python cache
 __pycache__/
