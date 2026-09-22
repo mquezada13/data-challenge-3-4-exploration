@@ -1,11 +1,6 @@
-# Setting the root path for the imports
 from pathlib import Path
-import sys
-working_dir=Path.cwd()
-repo_root = (
-    working_dir.parent if working_dir.name =='notebooks' else working_dir)
-if repo_root not in sys.path: sys.path.insert(0,repo_root)
-
+# Resolve the workflow directory from this file location
+repo_root = Path(__file__).resolve().parents[1]
 
 
 
