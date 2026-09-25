@@ -83,7 +83,6 @@ simulated_background_remote_path = (
 )
 simulated_background_path = data_dir / simulated_background_filename
 
-
 # -----------------------------------------------------------------------------
 # Detector responses
 # -----------------------------------------------------------------------------
@@ -154,6 +153,13 @@ simulated_background_511_binned_path = (
     data_dir_out / simulated_background_511_binned_filename
 )
 
+
+# -----------------------------------------------------------------------------
+# Modeled background input
+# -----------------------------------------------------------------------------
+
+modelled_background_filename = "background_model_511_combined_baseline_raw.hdf5"
+modelled_background_path  = data_dir_out / modelled_background_filename
 
 # -----------------------------------------------------------------------------
 # Binning configuration files
