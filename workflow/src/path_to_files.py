@@ -161,6 +161,7 @@ simulated_background_511_binned_path = (
 modelled_background_filename = "background_model_511_combined_baseline_raw.hdf5"
 modelled_background_511_binned_path  = data_dir_out / modelled_background_filename
 
+
 # -----------------------------------------------------------------------------
 # Binning configuration files
 # -----------------------------------------------------------------------------
@@ -171,3 +172,7 @@ config_511_path = config_dir / "dataio_511.yaml"
 config_continuum_path = config_dir / "dataio_continuum.yaml"
 config_511_background_path = config_dir / "dataio_511_background.yaml"
 config_deconvo_path = config_dir / "imagedeconvolution_gal_511keV.yml"
+
+
+# Final 511 keV reconstruction used by Goal 2.
+reconstructed_511_image_path = data_dir_out / "reconstructed_511_final.hdf5"
