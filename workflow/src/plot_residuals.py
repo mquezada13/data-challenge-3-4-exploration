@@ -1,3 +1,5 @@
+"""Plot residual diagnostics for histogram projections."""
+
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
@@ -9,10 +11,19 @@ import mhealpy as mhp
 
 
 class PlottingResiduals:
-    """Create residual diagnostic plots from a ResidualAnalysis object."""
+    """Create residual diagnostic figures from a residual analysis.
+
+    The class supports one-dimensional, rectangular two-dimensional, and
+    HEALPix residual views prepared by a ``ResidualAnalysis`` instance.
+    """
 
     def __init__(self, analysis) -> None:
-        """Store the analysis object used by the plotting methods."""
+        """Store the analysis object used to calculate and plot residuals.
+
+        Args:
+            analysis: A ``ResidualAnalysis`` instance containing the observed
+                and expected histograms.
+        """
         # Keep the analysis object available to this instance.
         self.analysis = analysis
 
@@ -29,7 +40,25 @@ class PlottingResiduals:
         residual_type: str = "raw",
         phi_bin_index: int | None = None,
     ) -> Figure:
-        """Create a residual plot for the selected projection and residual type."""
+        """Create a residual figure for a selected projection.
+
+        Args:
+            projection_id: Key identifying a projection returned by
+                ``ResidualAnalysis.projected_data``.
+            residual_type: Residual definition: ``"raw"``, ``"pearson"``, or
+                ``"fractional"``.
+            phi_bin_index: Phi-bin index for a slice of
+                ``"Phi_PsiChi_projection"``. Leave as ``None`` for
+                ``"PsiChi_projection"`` and other projections.
+
+        Returns:
+            The Matplotlib figure containing the requested diagnostic.
+
+        Raises:
+            ValueError: If the projection is unknown or a Phi index is required.
+            IndexError: If ``phi_bin_index`` is outside the available Phi bins.
+            NotImplementedError: If the projection does not have a plotter.
+        """
         projected_data = self.analysis.projected_data()
 
         if projection_id not in projected_data:
@@ -43,15 +72,16 @@ class PlottingResiduals:
         if projection_id in two_dimensional_ids:
             return self._plot_2d_projections(residual_type)
 
-        # Route one Phi slice of the joint Phi-PsiChi projection to its HEALPix plot.
-        if projection_id == "Phi_PsiChi_projection":
-            if phi_bin_index is None:
-                raise ValueError(
-                    "Provide phi_bin_index to select a Phi slice."
-                )
-            return self._plot_psichi_slice(
-                phi_bin_index,
+        # Route HEALPix projections to their shared plotter.
+        healpix_ids = {
+            "PsiChi_projection",
+            "Phi_PsiChi_projection",
+        }
+        if projection_id in healpix_ids:
+            return self._plot_psichi_projection(
+                projection_id,
                 residual_type,
+                phi_bin_index,
             )
 
         # Route supported one-dimensional projections to their plotter.
@@ -81,7 +111,7 @@ class PlottingResiduals:
         )
 
     #---------------------------------------------------------------------------
-    # Heler function for 1D plotting
+    # Helper function for 1D plotting
     #---------------------------------------------------------------------------
     def _plot_1d_projection(
         self,
@@ -90,7 +120,20 @@ class PlottingResiduals:
         residual_hist: Histogram,
         residual_type: str,
     ) -> Figure:
-        """Plot observed and expected counts with one-dimensional residuals."""
+        """Plot observed and expected counts with one-dimensional residuals.
+
+        Args:
+            observed_hist: Observed counts projected onto one axis.
+            expected_hist: Expected counts projected onto the same axis.
+            residual_hist: Selected residual values for that projection.
+            residual_type: Residual definition used for labels and layout.
+
+        Returns:
+            The Matplotlib figure containing the one-dimensional diagnostic.
+
+        Raises:
+            ValueError: If ``residual_type`` is not supported.
+        """
         
         # Get the single coordinate axis from this one-dimensional histogram.
         axis_name = observed_hist.axes.labels[0]
@@ -252,7 +295,19 @@ class PlottingResiduals:
         self,
         residual_type: str,
     ) -> Figure:
-        """Plot the Phi-Chi and Phi-Psi residual views side by side."""
+        """Plot Phi-Chi and Phi-Psi residual views side by side.
+
+        Args:
+            residual_type: Residual definition: ``"raw"``, ``"pearson"``, or
+                ``"fractional"``.
+
+        Returns:
+            The Matplotlib figure containing both rectangular residual maps.
+
+        Raises:
+            ValueError: If ``residual_type`` is not supported or a projection
+                has no finite residual values.
+        """
         if residual_type not in {"raw", "pearson", "fractional"}:
             raise ValueError(f"Unknown residual type: {residual_type}")
 
@@ -451,40 +506,81 @@ class PlottingResiduals:
     # Helper for plotting HEALPix
     #---------------------------------------------------------------------------
 
-    def _plot_psichi_slice(
+    def _plot_psichi_projection(
         self,
-        phi_bin_index: int,
+        projection_id: str,
         residual_type: str,
+        phi_bin_index: int | None = None,
     ) -> Figure:
-        """Plot a HEALPix residual map and distribution for one Phi bin."""
+        """Plot a PsiChi residual map, optionally for one Phi bin.
+
+        Args:
+            projection_id: Either ``"PsiChi_projection"`` for the view
+                integrated over Phi, or ``"Phi_PsiChi_projection"`` for a
+                selected Phi slice.
+            residual_type: Residual definition: ``"raw"``, ``"pearson"``, or
+                ``"fractional"``.
+            phi_bin_index: Phi-bin index required for
+                ``"Phi_PsiChi_projection"``; leave as ``None`` for the
+                Phi-integrated projection.
+
+        Returns:
+            The Matplotlib figure containing the HEALPix map and distribution.
+
+        Raises:
+            ValueError: If the residual type or projection is unsupported, or
+                if the Phi index is missing or not applicable.
+            IndexError: If ``phi_bin_index`` is outside the available bins.
+        """
         if residual_type not in {"raw", "pearson", "fractional"}:
             raise ValueError(f"Unknown residual type: {residual_type}")
 
-        # Calculate the selected residual for the joint Phi-PsiChi projection.
-        residual_hist = self.analysis.residual_function(
+        if projection_id not in {
+            "PsiChi_projection",
             "Phi_PsiChi_projection",
+        }:
+            raise ValueError(f"Unknown HEALPix projection: {projection_id}")
+
+        # Calculate the selected residual for the requested HEALPix projection.
+        residual_hist = self.analysis.residual_function(
+            projection_id,
             residual_type,
         )
 
-        # Get the Phi-bin center and the HEALPix axis.
-        phi_axis = residual_hist.axes["Phi"]
-        phi_centers = phi_axis.centers.to_value(u.deg)
-
-        if not 0 <= phi_bin_index < len(phi_centers):
-            raise IndexError("phi_bin_index is outside the available Phi bins.")
-
+        # Get the HEALPix axis and select a Phi slice only when requested.
         psichi_axis = residual_hist.axes["PsiChi"]
-        phi_value = phi_centers[phi_bin_index]
+        if projection_id == "Phi_PsiChi_projection":
+            if phi_bin_index is None:
+                raise ValueError(
+                    "Provide phi_bin_index to select a Phi slice."
+                )
 
-        # Select this Phi bin and keep only defined residuals for the distribution.
-        slice_values = np.asarray(
-            residual_hist.contents[phi_bin_index],
-            dtype=float,
-        )
-        finite_values = slice_values[np.isfinite(slice_values)]
+            phi_axis = residual_hist.axes["Phi"]
+            phi_centers = phi_axis.centers.to_value(u.deg)
+            if not 0 <= phi_bin_index < len(phi_centers):
+                raise IndexError(
+                    "phi_bin_index is outside the available Phi bins."
+                )
+
+            map_values = np.asarray(
+                residual_hist.contents[phi_bin_index],
+                dtype=float,
+            )
+            view_label = f"at Phi = {phi_centers[phi_bin_index]:.1f} deg"
+        else:
+            if phi_bin_index is not None:
+                raise ValueError(
+                    "phi_bin_index applies only to Phi_PsiChi_projection."
+                )
+
+            map_values = np.asarray(residual_hist.contents, dtype=float)
+            view_label = "integrated over Phi"
+
+        # Keep only defined residuals for the distribution.
+        finite_values = map_values[np.isfinite(map_values)]
 
         if finite_values.size == 0:
-            raise ValueError("This Phi bin has no finite residual values.")
+            raise ValueError("This HEALPix view has no finite residual values.")
 
         # Center the map color scale on zero.
         color_limit = np.max(np.abs(finite_values))
@@ -499,7 +595,7 @@ class PlottingResiduals:
 
         # Build the map using the original HEALPix geometry.
         sky_map = mhp.HealpixMap(
-            data=slice_values,
+            data=map_values,
             nside=psichi_axis.nside,
             scheme=psichi_axis.scheme,
             coordsys=psichi_axis.coordsys,
@@ -514,7 +610,7 @@ class PlottingResiduals:
         )
         distribution_axis = figure.add_subplot(1, 2, 2)
 
-        # Plot the residual map for this Phi bin.
+        # Plot the residual map.
         map_image, map_axis = sky_map.plot(
             ax=map_axis,
             cmap="RdBu_r",
@@ -523,7 +619,7 @@ class PlottingResiduals:
         )
         map_axis.set_title(
             f"{residual_type.capitalize()} residual on PsiChi "
-            f"at Phi = {phi_value:.1f} deg"
+            f"{view_label}"
         )
 
         colorbar_label = (
@@ -596,7 +692,7 @@ class PlottingResiduals:
             },
         )
         distribution_axis.set_title(
-            f"Residual distribution at Phi = {phi_value:.1f} deg"
+            f"Residual distribution {view_label}"
         )
         distribution_axis.set_xlabel(f"{residual_type.capitalize()} residual")
         distribution_axis.set_ylabel("Probability density")
