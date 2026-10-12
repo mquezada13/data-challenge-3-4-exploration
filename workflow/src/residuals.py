@@ -65,6 +65,9 @@ class ResidualAnalysis:
             ),
         )
 
+        # Initialize the projection cache.
+        self._projected_data_cache = None
+
     def mask_function(self) -> tuple[np.ndarray, dict[str, object]]:
         """Build the valid-bin mask and summarize its effect."""
         # Define a numerical-zero threshold near the float64 limit.
@@ -299,6 +302,11 @@ class ResidualAnalysis:
 
     def projected_data(self) -> dict[str, dict[str, Histogram]]:
         """Prepare the supported projected and split data products."""
+
+        # Reuse the projections if they have already been built.
+        if self._projected_data_cache is not None:
+            return self._projected_data_cache
+    
         phi_products = self.projection_function("Phi")
         psichi_products = self.projection_function("PsiChi")
         phi_psichi_products = self.projection_function("Phi", "PsiChi")
@@ -316,7 +324,9 @@ class ResidualAnalysis:
             "Phi_Psi_projection": phi_split_products["Phi_Psi"],
         }
 
-        return projection_dictionary
+        # Save the projections so later calls can reuse them.
+        self._projected_data_cache = projection_dictionary
+        return self._projected_data_cache
 
 
     def residual_function(
