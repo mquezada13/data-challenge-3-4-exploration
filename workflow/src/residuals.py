@@ -1,17 +1,7 @@
-from pathlib import Path
-import sys
-
 import numpy as np
 import pandas as pd
-from histpy import Axis, Histogram 
+from histpy import Axis, Histogram
 import astropy.units as u
-import mhealpy as mhp
-import matplotlib.pyplot as plt
-from matplotlib.colors import TwoSlopeNorm
-from astropy.coordinates import SkyCoord
-from scipy import stats
-# Inspect the internal structure of HDF5 files.
-import h5py
 
 
 class ResidualAnalysis:
@@ -25,26 +15,24 @@ class ResidualAnalysis:
         self.expected_hist = expected
 
         products = {
-                    'observed' : self.observed_hist,
-                    "expected" : self.expected_hist,
-                }
+            "observed": self.observed_hist,
+            "expected": self.expected_hist,
+        }
 
-       
         if self.expected_hist.axes != self.observed_hist.axes:
             raise ValueError(
-                    "Observed and expected histograms must have matching axes."
-                    )
+                "Observed and expected histograms must have matching axes."
+            )
         if self.observed_hist.shape != self.expected_hist.shape:
-                    raise ValueError(
-                                "Observed and expected histograms must have the same shape."
-                            )
-        
+            raise ValueError(
+                "Observed and expected histograms must have the same shape."
+            )
 
         for product_name, histogram in products.items():
             values = np.asanyarray(
                 histogram.contents,
                 dtype=float,
-                copy=True
+                copy=True,
             )
 
             if not np.all(np.isfinite(values)):
@@ -55,17 +43,17 @@ class ResidualAnalysis:
                 raise ValueError(
                     f"{product_name} contains negative values."
                 )
-        #Build and store the mask and its report.
+        # Build and store the mask and its report.
         self.mask, self.mask_report = self.mask_function()
 
-        # Create masked copies without changing the original histograms
+        # Create masked copies without changing the original histograms.
         self.masked_observed_hist = Histogram(
             list(self.observed_hist.axes),
-            contents = np.where(
+            contents=np.where(
                 self.mask,
                 self.observed_hist.contents,
                 0.0,
-            )
+            ),
         )
 
         self.masked_expected_hist = Histogram(
@@ -73,96 +61,94 @@ class ResidualAnalysis:
             contents=np.where(
                 self.mask,
                 self.expected_hist.contents,
-                0.0
-            )
+                0.0,
+            ),
         )
 
-    #-------------------------------------------------------------------------------------------------------
-    #-------------------------------------------------------------------------------------------------------
-    ## Masking funtion       
-    #-------------------------------------------------------------------------------------------------------
-    #-------------------------------------------------------------------------------------------------------
     def mask_function(self) -> tuple[np.ndarray, dict[str, object]]:
         """Build the valid-bin mask and summarize its effect."""
-         # Define a numerical-zero threshold near the float64 limit 
+        # Define a numerical-zero threshold near the float64 limit.
         numerical_floor = 10 * np.finfo(float).tiny
 
-        # identify bins whose expectation is effectively numerical zero
+        # Identify bins whose expectation is effectively numerical zero.
         numerical_floor_mask = self.expected_hist.contents <= numerical_floor
 
         # Do not silently exclude bins that contain observed events.
-        observed_at_numerical_floor = self.observed_hist.contents[numerical_floor_mask].sum()
+        observed_at_numerical_floor = self.observed_hist.contents[
+            numerical_floor_mask
+        ].sum()
 
-        # Ensure that the mask retains data for the residual calculation
+        # Ensure that the mask retains data for the residual calculation.
         if observed_at_numerical_floor > 0:
             raise ValueError(
-                        "Numerical-floor bins contain observed events and cannot "
-                        "be excluded automatically."
-                    )
-        # Exclude only safe numerical floor bins
+                "Numerical-floor bins contain observed events and cannot "
+                "be excluded automatically."
+            )
+        # Exclude only safe numerical-floor bins.
         valid_mask = ~numerical_floor_mask
 
-        # Ensure that the mask retains data for the residual calculation
+        # Ensure that the mask retains data for the residual calculation.
         if not np.any(valid_mask):
-             raise ValueError(
-                  "No valid bins remain after applying the numerical-floor mask"
-             )
-        # Summarise the mask authomatic masking decision
+            raise ValueError(
+                "No valid bins remain after applying the numerical-floor mask."
+            )
+        # Summarize the automatic masking decision.
         mask_report = {
-                "total_bins": valid_mask.size,
-                "valid_bins": np.count_nonzero(valid_mask),
-                "excluded_bins": np.count_nonzero(~valid_mask),
-                "observed_counts_excluded": observed_at_numerical_floor,
-                "minimum_expected": self.expected_hist.contents.min(),
-                "minimum_retained_expected": self.expected_hist.contents[valid_mask].min(),
-            }
+            "total_bins": valid_mask.size,
+            "valid_bins": np.count_nonzero(valid_mask),
+            "excluded_bins": np.count_nonzero(~valid_mask),
+            "observed_counts_excluded": observed_at_numerical_floor,
+            "minimum_expected": self.expected_hist.contents.min(),
+            "minimum_retained_expected": self.expected_hist.contents[
+                valid_mask
+            ].min(),
+        }
         return valid_mask, mask_report
 
-
-    #-------------------------------------------------------------------------------------------------------
-    #-------------------------------------------------------------------------------------------------------
-    ## Projection function      
-    #-------------------------------------------------------------------------------------------------------
-    #-------------------------------------------------------------------------------------------------------
-
     def projection_function(self, *axis_names: str) -> dict[str, Histogram]:
-         """Project the masked observed and expected histograms onto selected axes."""
+        """Project masked histograms onto the requested axes.
 
-         if not axis_names : 
-              raise ValueError(
-                   "Provide at least one axis for the projection"
-              )
+        Args:
+            *axis_names: Histogram axis labels to retain in the projection.
 
-         reference_histograms = self.observed_hist
-         available_axes = set(reference_histograms.axes.labels)
-         unknown_axes = set(axis_names) - available_axes
+        Returns:
+            A dictionary containing the projected observed and expected histograms.
+        """
 
-         if unknown_axes:
-              raise ValueError(
-                          f"Unknown projection axes: {sorted(unknown_axes)}"
-                      )
+        if not axis_names:
+            raise ValueError("Provide at least one axis for the projection.")
 
-         
-         projected_obs = self.masked_observed_hist.project(*axis_names)
-         projected_exp = self.masked_expected_hist.project(*axis_names)
-         
-        # Return both projections under their product names
-         return {
+        available_axes = set(self.observed_hist.axes.labels)
+        unknown_axes = set(axis_names) - available_axes
+
+        if unknown_axes:
+            raise ValueError(
+                f"Unknown projection axes: {sorted(unknown_axes)}"
+            )
+
+        projected_obs = self.masked_observed_hist.project(*axis_names)
+        projected_exp = self.masked_expected_hist.project(*axis_names)
+
+        # Return both projections under their product names.
+        return {
             "observed": projected_obs,
             "expected": projected_exp,
         }
 
-    #-------------------------------------------------------------------------------------------------------
-    #-------------------------------------------------------------------------------------------------------
-    ## Split PsiChi function      
-    #-------------------------------------------------------------------------------------------------------
-    #-------------------------------------------------------------------------------------------------------
     def split_psichi_function(
         self,
         psichi_products: dict[str, Histogram],
         bin_width: float = 5.0,
     ) -> dict[str, dict[str, Histogram]]:
-        """Split a PsiChi projection into Chi and Psi histograms."""
+        """Split a PsiChi projection into Chi and Psi histograms.
+
+        Args:
+            psichi_products: Matched observed and expected PsiChi histograms.
+            bin_width: Angular bin width in degrees for Chi and Psi.
+
+        Returns:
+            Chi and Psi products, retaining Phi when it is present.
+        """
         # Get the HEALPix axis from the projected observed histogram.
         observed_histogram = psichi_products["observed"]
         psichi_axis = observed_histogram.axes["PsiChi"]
@@ -310,12 +296,7 @@ class ResidualAnalysis:
             "Psi": psi_products,
         }
 
-    #-------------------------------------------------------------------------------------------------------
-    #-------------------------------------------------------------------------------------------------------
-    ## Obtaining projected data  
-    #-------------------------------------------------------------------------------------------------------
-    #-------------------------------------------------------------------------------------------------------
-        
+
     def projected_data(self) -> dict[str, dict[str, Histogram]]:
         """Prepare the supported projected and split data products."""
         phi_products = self.projection_function("Phi")
@@ -338,23 +319,21 @@ class ResidualAnalysis:
         return projection_dictionary
 
 
-    #-------------------------------------------------------------------------------------------------------
-    #-------------------------------------------------------------------------------------------------------
-    ## Residual functions    
-    #-------------------------------------------------------------------------------------------------------
-    #-------------------------------------------------------------------------------------------------------
-
-    
-    def ResidualFunction(
+    def residual_function(
         self,
         projection_id: str,
         residual_type: str = "raw",
     ) -> Histogram:
-        """
-        Calculate a selected residual for one named projection.
-        """
+        """Calculate a selected residual for one named projection.
 
+        Args:
+            projection_id: Key identifying a supported projected data product.
+            residual_type: Residual definition: ``raw``, ``pearson``, or
+                ``fractional``.
 
+        Returns:
+            A histogram containing the selected residual values.
+        """
         projected_data = self.projected_data()
 
         if projection_id not in projected_data:
@@ -364,20 +343,19 @@ class ResidualAnalysis:
         observed_hist = projection_products["observed"]
         expected_hist = projection_products["expected"]
 
-        # General data difference used in every residual function 
+        # Calculate the observed-minus-expected difference.
         difference = observed_hist - expected_hist
-        # Creating the mask to keep only valid bins
+        # Keep only bins with positive projected expectation for normalized residuals.
         valid_mask = expected_hist.contents > 0
 
         if residual_type == "raw":
             residual = difference
 
         elif residual_type == "pearson":
-            # Calculate the numerator as a projected histogram.
+            # Use the observed-minus-expected histogram as the numerator.
             pearson_numerator = difference
 
-
-            # Select valid bins
+            # Leave undefined bins as NaN while preserving the histogram shape.
             pearson_values = np.full(
                 expected_hist.shape,
                 np.nan,
@@ -397,7 +375,7 @@ class ResidualAnalysis:
             )
 
         elif residual_type == "fractional":
-            # Calculate fracrtional residuals in bins with positive expectation
+            # Calculate fractional residuals in bins with positive expectation.
             fractional_values = np.full(
                 expected_hist.shape,
                 np.nan,
@@ -411,8 +389,8 @@ class ResidualAnalysis:
 
             residual = Histogram(
                 list(expected_hist.axes),
-                     contents = fractional_values,
-                     track_overflow = False,
+                contents=fractional_values,
+                track_overflow=False,
             )
         else:
             raise ValueError(
@@ -422,10 +400,12 @@ class ResidualAnalysis:
             
         return residual
 
-    
+
     def statistics_table(self) -> pd.DataFrame:
-        """
-        Build a table of global model-fit statistics
+        """Build a table of global model-fit statistics.
+
+        Returns:
+            A DataFrame with global counts, residual statistics, and notes.
         """
 
         # Select the original observed and expected counts in valid bins.
@@ -478,6 +458,7 @@ class ResidualAnalysis:
         )
 
         poisson_deviance = float(2.0 * deviance_sum)
+
         # Collect the global statistics and their interpretations.
         statistics_rows = [
             {
@@ -526,4 +507,3 @@ class ResidualAnalysis:
         ]
 
         return pd.DataFrame(statistics_rows)
-            
