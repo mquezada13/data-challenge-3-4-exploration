@@ -316,12 +316,12 @@ class ResidualAnalysis:
 
         projection_dictionary = {
             "Phi_projection": phi_products,
-            "PsiChi_projection": psichi_products,
             "Chi_projection": split_products["Chi"],
             "Psi_projection": split_products["Psi"],
-            "Phi_PsiChi_projection": phi_psichi_products,
+            "PsiChi_projection": psichi_products,
             "Phi_Chi_projection": phi_split_products["Phi_Chi"],
             "Phi_Psi_projection": phi_split_products["Phi_Psi"],
+            "Phi_PsiChi_projection": phi_psichi_products,
         }
 
         # Save the projections so later calls can reuse them.

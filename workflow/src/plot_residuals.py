@@ -349,11 +349,19 @@ class PlottingResiduals:
                 }
             )
 
-        # Use one symmetric color scale to compare the two maps.
-        color_limit = max(
-            np.max(np.abs(view["finite_values"]))
-            for view in residual_views
-        )
+        # Use a robust shared scale for fractional maps so one outlier does not
+        # wash out the remaining spatial structure.
+        if residual_type == "fractional":
+            all_absolute_values = np.concatenate(
+                [np.abs(view["finite_values"]) for view in residual_views]
+            )
+            color_limit = np.quantile(all_absolute_values, 0.995)
+        else:
+            # Keep the full symmetric range for raw and Pearson residual maps.
+            color_limit = max(
+                np.max(np.abs(view["finite_values"]))
+                for view in residual_views
+            )
         if color_limit == 0:
             color_limit = 1.0
 
@@ -364,14 +372,21 @@ class PlottingResiduals:
         )
 
         if residual_type == "raw":
-            figure, map_axes = plt.subplots(
+            # Reserve a separate column for the shared colorbar.
+            figure = plt.figure(figsize=(15, 5))
+            grid = figure.add_gridspec(
                 nrows=1,
-                ncols=2,
-                figsize=(15, 5),
-                sharey=True,
+                ncols=3,
+                width_ratios=[1, 1, 0.05],
+                wspace=0.25,
             )
+            map_axes = [
+                figure.add_subplot(grid[0, 0]),
+                figure.add_subplot(grid[0, 1]),
+            ]
+            map_axes[1].sharey(map_axes[0])
+            colorbar_axis = figure.add_subplot(grid[0, 2])
             distribution_axes = None
-            colorbar_axis = None
         else:
             # Reserve space for two distributions and one shared colorbar.
             figure = plt.figure(figsize=(14, 10))
@@ -483,19 +498,16 @@ class PlottingResiduals:
                 distribution_axis.legend()
                 distribution_axis.grid(alpha=0.2)
 
-        # Add one colorbar shared by both maps.
-        if colorbar_axis is None:
-            figure.colorbar(
-                map_images[-1],
-                ax=map_axes,
-                label=f"{residual_type.capitalize()} residual [counts]",
-            )
-        else:
-            figure.colorbar(
-                map_images[-1],
-                cax=colorbar_axis,
-                label=f"{residual_type.capitalize()} residual",
-            )
+        # Add one colorbar shared by both maps in its reserved axis.
+        colorbar_label = f"{residual_type.capitalize()} residual"
+        if residual_type == "raw":
+            colorbar_label += " [counts]"
+        figure.colorbar(
+            map_images[-1],
+            cax=colorbar_axis,
+            label=colorbar_label,
+            extend="both" if residual_type == "fractional" else "neither",
+        )
 
         figure.tight_layout()
         plt.show()
