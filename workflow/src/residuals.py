@@ -9,10 +9,25 @@ class ResidualAnalysis:
         self,
         observed: Histogram,
         expected: Histogram,
+        expected_floor: float | None = None,
     ) -> None:
-        """Initialize the analysis with observed and expected histograms."""
+        """Initialize the analysis with observed and expected histograms.
+
+        Args:
+            observed: Histogram containing observed counts.
+            expected: Histogram containing fitted expected counts.
+            expected_floor: Optional artificial floor used when preparing the
+                expected histogram. Bins at or below this value are excluded
+                only when they contain no observed counts.
+        """
         self.observed_hist = observed
         self.expected_hist = expected
+        self.expected_floor = expected_floor
+
+        if expected_floor is not None and (
+            not np.isfinite(expected_floor) or expected_floor < 0
+        ):
+            raise ValueError("expected_floor must be finite and non-negative.")
 
         products = {
             "observed": self.observed_hist,
@@ -67,40 +82,47 @@ class ResidualAnalysis:
 
         # Initialize the projection cache.
         self._projected_data_cache = None
+        self._poisson_reference_cache = {}
 
     def mask_function(self) -> tuple[np.ndarray, dict[str, object]]:
         """Build the valid-bin mask and summarize its effect."""
         # Define a numerical-zero threshold near the float64 limit.
         numerical_floor = 10 * np.finfo(float).tiny
+        exclusion_threshold = numerical_floor
 
-        # Identify bins whose expectation is effectively numerical zero.
-        numerical_floor_mask = self.expected_hist.contents <= numerical_floor
+        # Include a known artificial floor when one was supplied.
+        if self.expected_floor is not None:
+            exclusion_threshold = max(numerical_floor, self.expected_floor)
+
+        # Identify bins at or below the selected floor.
+        floor_mask = self.expected_hist.contents <= exclusion_threshold
 
         # Do not silently exclude bins that contain observed events.
-        observed_at_numerical_floor = self.observed_hist.contents[
-            numerical_floor_mask
+        observed_at_floor = self.observed_hist.contents[
+            floor_mask
         ].sum()
 
         # Ensure that the mask retains data for the residual calculation.
-        if observed_at_numerical_floor > 0:
+        if observed_at_floor > 0:
             raise ValueError(
-                "Numerical-floor bins contain observed events and cannot "
+                "Expected-floor bins contain observed events and cannot "
                 "be excluded automatically."
             )
-        # Exclude only safe numerical-floor bins.
-        valid_mask = ~numerical_floor_mask
+        # Exclude only floor bins that contain no observed events.
+        valid_mask = ~floor_mask
 
         # Ensure that the mask retains data for the residual calculation.
         if not np.any(valid_mask):
             raise ValueError(
-                "No valid bins remain after applying the numerical-floor mask."
+                "No valid bins remain after applying the expected-floor mask."
             )
         # Summarize the automatic masking decision.
         mask_report = {
             "total_bins": valid_mask.size,
             "valid_bins": np.count_nonzero(valid_mask),
             "excluded_bins": np.count_nonzero(~valid_mask),
-            "observed_counts_excluded": observed_at_numerical_floor,
+            "observed_counts_excluded": observed_at_floor,
+            "expected_floor": self.expected_floor,
             "minimum_expected": self.expected_hist.contents.min(),
             "minimum_retained_expected": self.expected_hist.contents[
                 valid_mask
@@ -146,20 +168,23 @@ class ResidualAnalysis:
         """Split a PsiChi projection into Chi and Psi histograms.
 
         Args:
-            psichi_products: Matched observed and expected PsiChi histograms.
+            psichi_products: Histograms sharing the same PsiChi axis and binning.
             bin_width: Angular bin width in degrees for Chi and Psi.
 
         Returns:
             Chi and Psi products, retaining Phi when it is present.
         """
-        # Get the HEALPix axis from the projected observed histogram.
-        observed_histogram = psichi_products["observed"]
-        psichi_axis = observed_histogram.axes["PsiChi"]
-        has_phi = "Phi" in observed_histogram.axes.labels
+        if not psichi_products:
+            raise ValueError("Provide at least one PsiChi histogram to split.")
+
+        # Use the first product to get the shared HEALPix and optional Phi axes.
+        reference_histogram = next(iter(psichi_products.values()))
+        psichi_axis = reference_histogram.axes["PsiChi"]
+        has_phi = "Phi" in reference_histogram.axes.labels
 
         # Keep the Phi axis when it is present in the projection.
         if has_phi:
-            phi_axis = observed_histogram.axes["Phi"]
+            phi_axis = reference_histogram.axes["Phi"]
 
         # Get the index of every HEALPix pixel.
         psichi_pixels = np.arange(psichi_axis.npix)
@@ -410,110 +435,322 @@ class ResidualAnalysis:
             
         return residual
 
+    def _project_simulated_counts(
+        self,
+        simulated_counts: np.ndarray,
+        projection_id: str,
+    ) -> Histogram:
+        """Apply the analysis mask and existing binning to simulated CDS counts."""
+        masked_histogram = Histogram(
+            list(self.expected_hist.axes),
+            contents=np.where(self.mask, simulated_counts, 0.0),
+            track_overflow=False,
+        )
 
-    def statistics_table(self) -> pd.DataFrame:
-        """Build a table of global model-fit statistics.
+        direct_axes = {
+            "Phi_projection": ("Phi",),
+            "PsiChi_projection": ("PsiChi",),
+            "Phi_PsiChi_projection": ("Phi", "PsiChi"),
+        }
+        split_axes = {
+            "Chi_projection": (("PsiChi",), "Chi"),
+            "Psi_projection": (("PsiChi",), "Psi"),
+            "Phi_Chi_projection": (("Phi", "PsiChi"), "Phi_Chi"),
+            "Phi_Psi_projection": (("Phi", "PsiChi"), "Phi_Psi"),
+        }
+
+        if projection_id in direct_axes:
+            return masked_histogram.project(*direct_axes[projection_id])
+
+        if projection_id in split_axes:
+            axes, split_name = split_axes[projection_id]
+            psichi_histogram = masked_histogram.project(*axes)
+            split_products = self.split_psichi_function(
+                {"simulated": psichi_histogram}
+            )
+            return split_products[split_name]["simulated"]
+
+        raise ValueError(f"Unknown projection: {projection_id}")
+
+    def pearson_poisson_reference(
+        self,
+        projection_id: str,
+        n_simulations: int = 1000,
+        bins: int = 15,
+        seed: int | None = None,
+        phi_bin_index: int | None = None,
+    ) -> dict[str, np.ndarray | int]:
+        """Get a simulated Pearson reference for one projection."""
+        references = self.prepare_pearson_poisson_references(
+            {projection_id: bins},
+            n_simulations=n_simulations,
+            seed=seed,
+            phi_bin_indices=(
+                {projection_id: phi_bin_index}
+                if phi_bin_index is not None
+                else None
+            ),
+        )
+        return references[(projection_id, phi_bin_index)]
+
+    def prepare_pearson_poisson_references(
+        self,
+        projection_bins: dict[str, int],
+        n_simulations: int = 1000,
+        seed: int | None = None,
+        phi_bin_indices: dict[str, int] | None = None,
+    ) -> dict[tuple[str, int | None], dict[str, np.ndarray | int]]:
+        """Prepare references for several plots from shared CDS simulations.
+
+        Each full-CDS Poisson realization is generated once and then projected
+        to every requested view. Projected residual values are temporarily
+        retained to establish common histogram edges; full-CDS datasets are
+        not stored. The resulting summaries are cached for the plotting methods.
+
+        Args:
+            projection_bins: Mapping from projection IDs to distribution
+                histogram bin counts. For example, use 15 for 1D views and 40
+                for 2D or HEALPix views.
+            n_simulations: Number of independent Poisson realizations.
+            seed: Optional seed for reproducibility.
+            phi_bin_indices: Optional Phi-bin index for each requested
+                ``"Phi_PsiChi_projection"`` slice.
 
         Returns:
-            A DataFrame with global counts, residual statistics, and notes.
+            References keyed by ``(projection_id, phi_bin_index)``. Each
+            reference contains common ``bin_edges``, mean ``density``,
+            pointwise 95% ``lower`` and ``upper`` limits, and the seed used.
+
+        Notes:
+            This fixed-fit reference is not a goodness-of-fit test. The
+            original mask is applied before projection, including its handling
+            of artificial expected-count floors.
         """
+        if (
+            isinstance(n_simulations, bool)
+            or not isinstance(n_simulations, int)
+            or n_simulations < 2
+        ):
+            raise ValueError("n_simulations must be an integer of at least 2.")
+        if not projection_bins:
+            raise ValueError("Provide at least one projection to simulate.")
 
-        # Select the original observed and expected counts in valid bins.
-        observed_values = np.asarray(
-            self.observed_hist.contents[self.mask],
+        phi_bin_indices = phi_bin_indices or {}
+        projected_data = self.projected_data()
+        effective_seed = (
+            int(seed)
+            if seed is not None
+            else int(np.random.SeedSequence().generate_state(1)[0])
+        )
+
+        requests = {}
+        references = {}
+        for projection_id, bins in projection_bins.items():
+            if isinstance(bins, bool) or not isinstance(bins, int) or bins < 1:
+                raise ValueError("Each histogram bin count must be a positive integer.")
+            if projection_id not in projected_data:
+                raise ValueError(f"Unknown projection: {projection_id}")
+
+            phi_bin_index = phi_bin_indices.get(projection_id)
+            if phi_bin_index is not None and projection_id != "Phi_PsiChi_projection":
+                raise ValueError(
+                    "phi_bin_indices applies only to Phi_PsiChi_projection."
+                )
+            if projection_id == "Phi_PsiChi_projection" and phi_bin_index is None:
+                raise ValueError(
+                    "Provide a Phi-bin index for Phi_PsiChi_projection."
+                )
+
+            cache_key = (
+                projection_id,
+                n_simulations,
+                bins,
+                effective_seed,
+                phi_bin_index,
+            )
+            reference_key = (projection_id, phi_bin_index)
+            if cache_key in self._poisson_reference_cache:
+                references[reference_key] = self._poisson_reference_cache[cache_key]
+                continue
+
+            expected_values = np.asarray(
+                projected_data[projection_id]["expected"].contents,
+                dtype=float,
+            )
+            observed_values = np.asarray(
+                self.residual_function(projection_id, "pearson").contents,
+                dtype=float,
+            )
+            if phi_bin_index is not None:
+                if not 0 <= phi_bin_index < expected_values.shape[0]:
+                    raise IndexError(
+                        "phi_bin_index is outside the available Phi bins."
+                    )
+                expected_values = expected_values[phi_bin_index]
+                observed_values = observed_values[phi_bin_index]
+
+            valid_mask = expected_values > 0
+            observed_values = observed_values[np.isfinite(observed_values)]
+            if observed_values.size == 0 or not np.any(valid_mask):
+                raise ValueError("No valid Pearson residual bins are available.")
+
+            requests[reference_key] = {
+                "projection_id": projection_id,
+                "phi_bin_index": phi_bin_index,
+                "bins": bins,
+                "expected": expected_values,
+                "valid_mask": valid_mask,
+                "observed": observed_values,
+                "minimum": float(np.min(observed_values)),
+                "maximum": float(np.max(observed_values)),
+                "cache_key": cache_key,
+                "samples": [],
+            }
+
+        if not requests:
+            return references
+
+        expected_full = np.asarray(
+            self.expected_hist.contents,
             dtype=float,
         )
 
-        expected_values = np.asarray(
-            self.expected_hist.contents[self.mask],
-            dtype=float,
-        )
-
-        # Count the valid and excluded bins in the original histograms.
-        valid_bin_count = int(np.count_nonzero(self.mask))
-        excluded_bin_count = int(np.count_nonzero(~self.mask))
-
-        # Sum the observed and expected counts included in the comparison.
-        observed_count_total = float(np.sum(observed_values))
-        expected_count_total = float(np.sum(expected_values))
-
-        # Sum the squared Pearson residual contribution from every valid bin.
-        pearson_chi_square = float(
-            np.sum(
-                (observed_values - expected_values) ** 2
-                / expected_values
+        def simulated_residuals(
+            simulated_full: np.ndarray,
+            request: dict[str, object],
+        ) -> np.ndarray:
+            # Apply the same mask and projection used for the observed data.
+            simulated_projection = self._project_simulated_counts(
+                simulated_full,
+                request["projection_id"],
             )
-        )
-
-        # Calculate the descriptive mean contribution per valid bin.
-        mean_pearson_contribution = pearson_chi_square / valid_bin_count
-
-        # Separate bins with zero observed counts to avoid taking log(0).
-        positive_observed = observed_values > 0
-
-        # For zero observed counts, the deviance contribution is the expectation.
-        deviance_sum = np.sum(expected_values[~positive_observed])
-
-        # Calculate the remaining Poisson deviance contributions.
-        deviance_sum += np.sum(
-            observed_values[positive_observed]
-            * np.log(
-                observed_values[positive_observed]
-                / expected_values[positive_observed]
+            projected_counts = np.asarray(
+                simulated_projection.contents,
+                dtype=float,
             )
-            - (
-                observed_values[positive_observed]
-                - expected_values[positive_observed]
+            if request["phi_bin_index"] is not None:
+                projected_counts = projected_counts[request["phi_bin_index"]]
+            expected_values = request["expected"]
+            valid_mask = request["valid_mask"]
+            return (
+                projected_counts[valid_mask] - expected_values[valid_mask]
+            ) / np.sqrt(expected_values[valid_mask])
+
+        # Generate each full-CDS realization once for every requested view.
+        generator = np.random.default_rng(effective_seed)
+        for _ in range(n_simulations):
+            simulated_full = generator.poisson(expected_full)
+            for request in requests.values():
+                values = simulated_residuals(simulated_full, request)
+                request["samples"].append(values)
+                request["minimum"] = min(
+                    request["minimum"], float(np.min(values))
+                )
+                request["maximum"] = max(
+                    request["maximum"], float(np.max(values))
+                )
+
+        # Histogram the saved projected residuals; full-CDS datasets are gone.
+        density_samples = {}
+        bin_edges_by_request = {}
+        for reference_key, request in requests.items():
+            minimum = request["minimum"]
+            maximum = request["maximum"]
+            if minimum == maximum:
+                minimum -= 0.5
+                maximum += 0.5
+            bin_edges = np.linspace(minimum, maximum, request["bins"] + 1)
+            bin_edges_by_request[reference_key] = bin_edges
+            samples = request["samples"]
+            bin_widths = np.diff(bin_edges)
+            n_valid = np.count_nonzero(request["valid_mask"])
+            density_samples[reference_key] = np.empty(
+                (n_simulations, request["bins"]),
+                dtype=float,
             )
-        )
 
-        poisson_deviance = float(2.0 * deviance_sum)
+            for simulation_index, values in enumerate(samples):
+                counts = np.histogram(values, bins=bin_edges)[0]
+                density_samples[reference_key][simulation_index] = (
+                    counts / (n_valid * bin_widths)
+                )
 
-        # Collect the global statistics and their interpretations.
-        statistics_rows = [
-            {
-                "Statistic": "Valid CDS bins",
-                "Value": valid_bin_count,
-                "Interpretation": "Bins included in the global comparison.",
-            },
-            {
-                "Statistic": "Excluded CDS bins",
-                "Value": excluded_bin_count,
-                "Interpretation": "Numerical-floor bins removed by the mask.",
-            },
-            {
-                "Statistic": "Observed counts in valid bins",
-                "Value": observed_count_total,
-                "Interpretation": "Observed events included in the comparison.",
-            },
-            {
-                "Statistic": "Expected counts in valid bins",
-                "Value": expected_count_total,
-                "Interpretation": "Model-predicted events in the same bins.",
-            },
-            {
-                "Statistic": "Pearson chi-square (χ²)",
-                "Value": pearson_chi_square,
-                "Interpretation": "Global sum of squared Pearson residuals.",
-            },
-            {
-                "Statistic": "Mean Pearson contribution per valid bin",
-                "Value": mean_pearson_contribution,
-                "Interpretation": "Descriptive average; not a reduced chi-square.",
-            },
-            {
-                "Statistic": "Poisson deviance",
-                "Value": poisson_deviance,
-                "Interpretation": "Global likelihood-based discrepancy from the model.",
-            },
-            {
-                "Statistic": "Global goodness-of-fit p-value",
-                "Value": "Not calibrated",
-                "Interpretation": (
-                    "Requires a justified reference distribution accounting "
-                    "for model fitting and low expected counts."
-                ),
-            },
-        ]
+        for reference_key, request in requests.items():
+            samples = density_samples[reference_key]
+            lower, upper = np.quantile(samples, [0.025, 0.975], axis=0)
+            reference = {
+                "bin_edges": bin_edges_by_request[reference_key],
+                "density": np.mean(samples, axis=0),
+                "lower": lower,
+                "upper": upper,
+                "seed": effective_seed,
+            }
+            references[reference_key] = reference
+            self._poisson_reference_cache[request["cache_key"]] = reference
 
-        return pd.DataFrame(statistics_rows)
+        return references
+
+    def statistics_table(self, residual_type: str) -> pd.DataFrame:
+        """Summarize one residual type across valid full-CDS bins.
+
+        The compact table contains one row with descriptive residual
+        statistics. Pearson residuals also report the fractions beyond two
+        and three standard deviations, Pearson chi-square, and Poisson
+        deviance. These are descriptive summaries; this method does not
+        calculate degrees of freedom or a goodness-of-fit probability.
+
+        Args:
+            residual_type: ``"raw"``, ``"pearson"``, or ``"fractional"``.
+
+        Returns:
+            A one-row DataFrame with the global full-CDS summary.
+        """
+        residual_types = {"raw", "pearson", "fractional"}
+        if residual_type not in residual_types:
+            raise ValueError(
+                "Unknown residual type. Choose 'raw', 'pearson', "
+                "or 'fractional'."
+            )
+
+        observed = np.asarray(self.observed_hist.contents[self.mask], dtype=float)
+        expected = np.asarray(self.expected_hist.contents[self.mask], dtype=float)
+        difference = observed - expected
+
+        if residual_type == "raw":
+            residual_values = difference
+        elif residual_type == "pearson":
+            residual_values = difference / np.sqrt(expected)
+        else:
+            residual_values = difference / expected
+
+        summary = {
+            "Valid bins (N)": residual_values.size,
+            "Mean residual": float(np.mean(residual_values)),
+            "Median residual": float(np.median(residual_values)),
+            "Std. dev.": float(np.std(residual_values)),
+            "Residual RMS": float(np.sqrt(np.mean(residual_values**2))),
+            "Minimum residual": float(np.min(residual_values)),
+            "Maximum residual": float(np.max(residual_values)),
+        }
+
+        if residual_type == "pearson":
+            positive_observed = observed > 0
+            deviance_terms = expected.copy()
+            deviance_terms[positive_observed] += observed[positive_observed] * (
+                np.log(observed[positive_observed] / expected[positive_observed])
+                - 1.0
+            )
+            summary.update(
+                {
+                    "|R| > 2 [%]": float(
+                        100 * np.mean(np.abs(residual_values) > 2)
+                    ),
+                    "|R| > 3 [%]": float(
+                        100 * np.mean(np.abs(residual_values) > 3)
+                    ),
+                    "Pearson chi-square": float(np.sum(residual_values**2)),
+                    "Poisson deviance": float(2 * np.sum(deviance_terms)),
+                }
+            )
+
+        return pd.DataFrame([summary])

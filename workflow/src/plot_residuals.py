@@ -17,15 +17,74 @@ class PlottingResiduals:
     HEALPix residual views prepared by a ``ResidualAnalysis`` instance.
     """
 
-    def __init__(self, analysis) -> None:
-        """Store the analysis object used to calculate and plot residuals.
+    _PEARSON_REFERENCE_BINS = {
+        "Phi_projection": 15,
+        "Chi_projection": 15,
+        "Psi_projection": 15,
+        "Phi_Chi_projection": 40,
+        "Phi_Psi_projection": 40,
+        "PsiChi_projection": 40,
+        "Phi_PsiChi_projection": 40,
+    }
+
+    def __init__(
+        self,
+        analysis,
+        n_simulations: int | None = None,
+        random_seed: int | None = None,
+        phi_bin_index: int | None = None,
+    ) -> None:
+        """Store the analysis and optional Pearson simulation settings.
 
         Args:
             analysis: A ``ResidualAnalysis`` instance containing the observed
                 and expected histograms.
+            n_simulations: Optional number of Poisson realizations used for
+                Pearson reference histograms. ``None`` keeps simulations off.
+            random_seed: Optional seed shared by the simulated references.
+            phi_bin_index: Optional Phi slice prepared with the other
+                references and used by ``Phi_PsiChi_projection`` by default.
         """
-        # Keep the analysis object available to this instance.
         self.analysis = analysis
+        self.n_simulations = n_simulations
+        self.random_seed = random_seed
+        self.phi_bin_index = phi_bin_index
+        self._generated_seed = None
+        self._prepared_reference_configs = set()
+
+    def _prepare_pearson_references(
+        self,
+        n_simulations: int,
+        random_seed: int,
+        phi_bin_index: int | None,
+    ) -> None:
+        """Prepare and cache the supported Pearson references once per setup."""
+        configuration = (n_simulations, random_seed, phi_bin_index)
+        if configuration in self._prepared_reference_configs:
+            return
+
+        available_projections = self.analysis.projected_data()
+        projection_bins = {
+            projection_id: bins
+            for projection_id, bins in self._PEARSON_REFERENCE_BINS.items()
+            if projection_id in available_projections
+            and (
+                projection_id != "Phi_PsiChi_projection"
+                or phi_bin_index is not None
+            )
+        }
+        phi_bin_indices = (
+            {"Phi_PsiChi_projection": phi_bin_index}
+            if "Phi_PsiChi_projection" in projection_bins
+            else None
+        )
+        self.analysis.prepare_pearson_poisson_references(
+            projection_bins,
+            n_simulations=n_simulations,
+            seed=random_seed,
+            phi_bin_indices=phi_bin_indices,
+        )
+        self._prepared_reference_configs.add(configuration)
 
 
     #---------------------------------------------------------------------------
@@ -39,6 +98,10 @@ class PlottingResiduals:
         projection_id: str,
         residual_type: str = "raw",
         phi_bin_index: int | None = None,
+        running_mean_window: int | None = None,
+        n_simulations: int | None = None,
+        random_seed: int | None = None,
+        show_gaussian_reference: bool | None = None,
     ) -> Figure:
         """Create a residual figure for a selected projection.
 
@@ -50,6 +113,18 @@ class PlottingResiduals:
             phi_bin_index: Phi-bin index for a slice of
                 ``"Phi_PsiChi_projection"``. Leave as ``None`` for
                 ``"PsiChi_projection"`` and other projections.
+            running_mean_window: Optional centered window size in bins for a
+                Pearson residual running mean. Windows are truncated at the
+                first and last bins; they do not wrap around the coordinate.
+            n_simulations: Number of fixed-fit Poisson realizations for the
+                Pearson residual distribution. If omitted, the constructor
+                setting is used; ``None`` keeps simulations off.
+            random_seed: Optional seed for reproducible Poisson realizations.
+                If omitted, the constructor setting is used. When simulations
+                are enabled without a seed, one seed is generated and reused.
+            show_gaussian_reference: Whether to overlay the theoretical
+                standard normal curve. By default it is shown without
+                simulations and hidden when simulations are requested.
 
         Returns:
             The Matplotlib figure containing the requested diagnostic.
@@ -61,6 +136,56 @@ class PlottingResiduals:
         """
         projected_data = self.analysis.projected_data()
 
+        if running_mean_window is not None:
+            if (
+                isinstance(running_mean_window, bool)
+                or not isinstance(running_mean_window, int)
+                or running_mean_window < 1
+            ):
+                raise ValueError("running_mean_window must be a positive integer.")
+            if residual_type != "pearson":
+                raise ValueError(
+                    "running_mean_window is only available for Pearson residuals."
+                )
+
+        if n_simulations is not None and residual_type != "pearson":
+            raise ValueError("Poisson simulations are only available for Pearson residuals.")
+        if show_gaussian_reference is not None and residual_type != "pearson":
+            raise ValueError(
+                "show_gaussian_reference is only available for Pearson residuals."
+            )
+        plot_n_simulations = None
+        plot_random_seed = None
+        reference_phi_bin_index = self.phi_bin_index
+        if projection_id == "Phi_PsiChi_projection":
+            if phi_bin_index is None:
+                phi_bin_index = self.phi_bin_index
+            reference_phi_bin_index = phi_bin_index
+        if residual_type == "pearson":
+            plot_n_simulations = (
+                n_simulations if n_simulations is not None else self.n_simulations
+            )
+            plot_random_seed = (
+                random_seed if random_seed is not None else self.random_seed
+            )
+            if plot_n_simulations is not None:
+                if plot_random_seed is None:
+                    if self._generated_seed is None:
+                        self._generated_seed = int(
+                            np.random.SeedSequence().generate_state(1)[0]
+                        )
+                    plot_random_seed = self._generated_seed
+                self._prepare_pearson_references(
+                    plot_n_simulations,
+                    plot_random_seed,
+                    reference_phi_bin_index,
+                )
+
+        if show_gaussian_reference is None:
+            show_gaussian = residual_type == "pearson" and plot_n_simulations is None
+        else:
+            show_gaussian = show_gaussian_reference
+
         if projection_id not in projected_data:
             raise ValueError(f"Unknown projection: {projection_id}")
 
@@ -70,7 +195,14 @@ class PlottingResiduals:
             "Phi_Psi_projection",
         }
         if projection_id in two_dimensional_ids:
-            return self._plot_2d_projections(residual_type)
+            if running_mean_window is not None:
+                raise ValueError("The running mean is only available for 1D plots.")
+            return self._plot_2d_projections(
+                residual_type,
+                plot_n_simulations,
+                plot_random_seed,
+                show_gaussian,
+            )
 
         # Route HEALPix projections to their shared plotter.
         healpix_ids = {
@@ -78,10 +210,15 @@ class PlottingResiduals:
             "Phi_PsiChi_projection",
         }
         if projection_id in healpix_ids:
+            if running_mean_window is not None:
+                raise ValueError("The running mean is only available for 1D plots.")
             return self._plot_psichi_projection(
                 projection_id,
                 residual_type,
                 phi_bin_index,
+                plot_n_simulations,
+                plot_random_seed,
+                show_gaussian,
             )
 
         # Route supported one-dimensional projections to their plotter.
@@ -107,7 +244,12 @@ class PlottingResiduals:
             observed_hist,
             expected_hist,
             residual_hist,
+            projection_id,
             residual_type,
+            running_mean_window,
+            plot_n_simulations,
+            plot_random_seed,
+            show_gaussian,
         )
 
     #---------------------------------------------------------------------------
@@ -118,7 +260,12 @@ class PlottingResiduals:
         observed_hist: Histogram,
         expected_hist: Histogram,
         residual_hist: Histogram,
+        projection_id: str,
         residual_type: str,
+        running_mean_window: int | None = None,
+        n_simulations: int | None = None,
+        random_seed: int | None = None,
+        show_gaussian_reference: bool = True,
     ) -> Figure:
         """Plot observed and expected counts with one-dimensional residuals.
 
@@ -178,6 +325,17 @@ class PlottingResiduals:
             linewidth=1.5,
             label="Observed",
         )
+        # Show the nominal one-sigma Poisson uncertainty around the prediction.
+        poisson_sigma = np.sqrt(expected_values)
+        counts_axis.fill_between(
+            x_values,
+            expected_values - poisson_sigma,
+            expected_values + poisson_sigma,
+            step="mid",
+            color="tab:orange",
+            alpha=0.3,
+            label=r"Poisson uncertainty ($\pm 1\sigma$)",
+        )
         counts_axis.step(
             x_values,
             expected_values,
@@ -191,7 +349,21 @@ class PlottingResiduals:
         counts_axis.set_title(
             f"{residual_type.capitalize()} residual as a function of {axis_name}"
         )
-        counts_axis.legend()
+        if residual_type in {"pearson", "fractional"}:
+            # Put the summary in the large count panel, separate from its legend.
+            statistics_text = self._format_residual_statistics(
+                residual_values,
+                residual_type,
+            )
+            counts_axis.text(
+                0.02,
+                0.97,
+                statistics_text,
+                transform=counts_axis.transAxes,
+                verticalalignment="top",
+                bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.85},
+            )
+        counts_axis.legend(loc="upper right")
         counts_axis.grid(alpha=0.2)
 
         # Show the corresponding residual values.
@@ -212,6 +384,33 @@ class PlottingResiduals:
         residual_axis.set_ylabel(f"{residual_type.capitalize()} residual")
         residual_axis.grid(alpha=0.2)
 
+        if running_mean_window is not None:
+            if residual_type != "pearson":
+                raise ValueError(
+                    "running_mean_window is only available for Pearson residuals."
+                )
+
+            # Use a centered window, truncating it rather than wrapping at edges.
+            running_mean = np.full(residual_values.shape, np.nan, dtype=float)
+            left_width = (running_mean_window - 1) // 2
+            right_width = running_mean_window // 2
+            for index in range(residual_values.size):
+                start = max(0, index - left_width)
+                stop = min(residual_values.size, index + right_width + 1)
+                window_values = residual_values[start:stop]
+                finite_window_values = window_values[np.isfinite(window_values)]
+                if finite_window_values.size:
+                    running_mean[index] = np.mean(finite_window_values)
+
+            residual_axis.plot(
+                x_values,
+                running_mean,
+                color="tab:orange",
+                linewidth=2,
+                label=f"Running mean ({running_mean_window} bins)",
+            )
+            residual_axis.legend(loc="upper right")
+
         if residual_type in {"pearson", "fractional"}:
             # Keep undefined residual bins out of the distribution.
             finite_residuals = residual_values[np.isfinite(residual_values)]
@@ -219,26 +418,84 @@ class PlottingResiduals:
             if finite_residuals.size == 0:
                 raise ValueError("No finite residual values are available to plot.")
 
-            distribution_axis.hist(
-                finite_residuals,
-                bins=15,
-                density=True,
-                color="tab:blue",
-                alpha=0.65,
-                label=f"{residual_type.capitalize()} residuals",
-            )
+            if residual_type == "pearson" and n_simulations is not None:
+                reference = self.analysis.pearson_poisson_reference(
+                    projection_id,
+                    n_simulations=n_simulations,
+                    bins=15,
+                    seed=random_seed,
+                )
+                bin_edges = reference["bin_edges"]
+                distribution_axis.hist(
+                    finite_residuals,
+                    bins=bin_edges,
+                    density=True,
+                    color="tab:blue",
+                    alpha=0.55,
+                    label="Observed Pearson residuals",
+                )
+                bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+                distribution_axis.stairs(
+                    reference["density"],
+                    bin_edges,
+                    color="black",
+                    linewidth=1.5,
+                    label="Poisson MC mean density",
+                )
+                distribution_axis.fill_between(
+                    bin_centers,
+                    reference["lower"],
+                    reference["upper"],
+                    step="mid",
+                    color="tab:orange",
+                    alpha=0.25,
+                    label="95% pointwise MC interval",
+                )
+            else:
+                distribution_axis.hist(
+                    finite_residuals,
+                    bins=15,
+                    density=True,
+                    color="tab:blue",
+                    alpha=0.65,
+                    label=f"{residual_type.capitalize()} residuals",
+                )
             distribution_axis.axvline(
                 0.0,
                 color="black",
                 linestyle=":",
                 linewidth=1,
-                label="Zero",
             )
 
-            if residual_type == "pearson":
+            if residual_type == "pearson" and show_gaussian_reference:
                 # Mark the commonly used range of two standard deviations.
-                residual_axis.axhspan(-2.0, 2.0, color="gray", alpha=0.15)
-                residual_axis.set_ylim(-5.0, 5.0)
+                # residual_axis.axhspan(-2.0, 2.0, color="gray", alpha=0.15)
+                # residual_axis.set_ylim(-5.0, 5.0)
+
+                # Show Pearson residual reference levels in nominal sigma units.
+                for level, color, linestyle in (
+                    (1.0, "gray", ":"),
+                    (2.0, "black", "--"),
+                    (3.0, "gray", "-."),
+                ):
+                    residual_axis.axhline(
+                        level,
+                        color=color,
+                        linestyle=linestyle,
+                        linewidth=0.9,
+                        label=rf"$\pm{level:.0f}\sigma$",
+                    )
+                    residual_axis.axhline(
+                        -level,
+                        color=color,
+                        linestyle=linestyle,
+                        linewidth=0.9,
+                    )
+                residual_axis.legend(
+                    loc="upper right",
+                    ncol=3,
+                    fontsize="small",
+                )
 
                 # Compare Pearson residuals with the standard normal density.
                 distribution_limit = max(
@@ -259,33 +516,44 @@ class PlottingResiduals:
                     label=r"Standard normal $N(0,1)$",
                 )
 
-            residual_mean = np.mean(finite_residuals)
-            residual_median = np.median(finite_residuals)
-            residual_std = np.std(finite_residuals)
-            residual_rms = np.sqrt(np.mean(finite_residuals**2))
-            statistics_text = (
-                f"N = {finite_residuals.size}\n"
-                f"Mean = {residual_mean:.3f}\n"
-                f"Median = {residual_median:.3f}\n"
-                f"Std. dev. = {residual_std:.3f}\n"
-                f"RMS = {residual_rms:.3f}"
-            )
-            distribution_axis.text(
-                0.03,
-                0.95,
-                statistics_text,
-                transform=distribution_axis.transAxes,
-                verticalalignment="top",
-                bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.85},
-            )
             distribution_axis.set_xlabel(f"{residual_type.capitalize()} residual")
             distribution_axis.set_ylabel("Probability density")
-            distribution_axis.legend()
+            distribution_axis.legend(loc="upper right")
             distribution_axis.grid(alpha=0.2)
 
         figure.tight_layout()
         plt.show()
         return figure
+
+    @staticmethod
+    def _format_residual_statistics(
+        values: np.ndarray,
+        residual_type: str,
+    ) -> str:
+        """Format descriptive residual statistics for plot annotations."""
+        values = np.asarray(values, dtype=float)
+        finite_values = values[np.isfinite(values)]
+        statistics = [
+            f"N = {finite_values.size}",
+            f"Mean = {np.mean(finite_values):.3f}",
+            f"Median = {np.median(finite_values):.3f}",
+            f"Std. dev. = {np.std(finite_values):.3f}",
+            f"RMS = {np.sqrt(np.mean(finite_values**2)):.3f}",
+            f"Min = {np.min(finite_values):.3f}",
+            f"Max = {np.max(finite_values):.3f}",
+        ]
+
+        if residual_type == "pearson":
+            absolute_values = np.abs(finite_values)
+            statistics.extend(
+                [
+                    f"|R| > 2 = {100 * np.mean(absolute_values > 2):.1f}%",
+                    f"|R| > 3 = {100 * np.mean(absolute_values > 3):.1f}%",
+                    rf"Pearson $\chi^2$ = {np.sum(finite_values**2):.2f}",
+                ]
+            )
+
+        return "\n".join(statistics)
 
     #---------------------------------------------------------------------------
     # Helper for plotting 2D
@@ -294,12 +562,18 @@ class PlottingResiduals:
     def _plot_2d_projections(
         self,
         residual_type: str,
+        n_simulations: int | None = None,
+        random_seed: int | None = None,
+        show_gaussian_reference: bool = True,
     ) -> Figure:
         """Plot Phi-Chi and Phi-Psi residual views side by side.
 
         Args:
             residual_type: Residual definition: ``"raw"``, ``"pearson"``, or
                 ``"fractional"``.
+            n_simulations: Optional number of fixed-fit Poisson realizations.
+            random_seed: Optional seed for reproducible simulations.
+            show_gaussian_reference: Whether to overlay a Gaussian reference.
 
         Returns:
             The Matplotlib figure containing both rectangular residual maps.
@@ -332,6 +606,14 @@ class PlottingResiduals:
             x_edges = products["observed"].axes[x_axis_name].edges.to_value(u.deg)
             residual_values = np.asarray(residual_hist.contents, dtype=float)
             finite_values = residual_values[np.isfinite(residual_values)]
+            simulation_reference = None
+            if residual_type == "pearson" and n_simulations is not None:
+                simulation_reference = self.analysis.pearson_poisson_reference(
+                    projection_id,
+                    n_simulations=n_simulations,
+                    bins=40,
+                    seed=random_seed,
+                )
 
             if finite_values.size == 0:
                 raise ValueError(
@@ -346,6 +628,7 @@ class PlottingResiduals:
                     "phi_edges": phi_edges,
                     "values": residual_values,
                     "finite_values": finite_values,
+                    "simulation_reference": simulation_reference,
                 }
             )
 
@@ -435,14 +718,43 @@ class PlottingResiduals:
             ):
                 finite_values = view["finite_values"]
 
-                distribution_axis.hist(
-                    finite_values,
-                    bins=40,
-                    density=True,
-                    color="tab:blue",
-                    alpha=0.65,
-                    label=f"{residual_type.capitalize()} residuals",
-                )
+                reference = view["simulation_reference"]
+                if reference is not None:
+                    bin_edges = reference["bin_edges"]
+                    distribution_axis.hist(
+                        finite_values,
+                        bins=bin_edges,
+                        density=True,
+                        color="tab:blue",
+                        alpha=0.55,
+                        label="Observed Pearson residuals",
+                    )
+                    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+                    distribution_axis.stairs(
+                        reference["density"],
+                        bin_edges,
+                        color="black",
+                        linewidth=1.5,
+                        label="Poisson MC mean density",
+                    )
+                    distribution_axis.fill_between(
+                        bin_centers,
+                        reference["lower"],
+                        reference["upper"],
+                        step="mid",
+                        color="tab:orange",
+                        alpha=0.25,
+                        label="95% pointwise MC interval",
+                    )
+                else:
+                    distribution_axis.hist(
+                        finite_values,
+                        bins=40,
+                        density=True,
+                        color="tab:blue",
+                        alpha=0.65,
+                        label=f"{residual_type.capitalize()} residuals",
+                    )
                 distribution_axis.axvline(
                     0.0,
                     color="black",
@@ -450,7 +762,7 @@ class PlottingResiduals:
                     linewidth=1,
                 )
 
-                if residual_type == "pearson":
+                if residual_type == "pearson" and show_gaussian_reference:
                     distribution_limit = max(
                         4.0,
                         1.1 * np.max(np.abs(finite_values)),
@@ -469,12 +781,9 @@ class PlottingResiduals:
                         label=r"Standard normal $N(0,1)$",
                     )
 
-                statistics_text = (
-                    f"N = {finite_values.size}\n"
-                    f"Mean = {np.mean(finite_values):.3f}\n"
-                    f"Median = {np.median(finite_values):.3f}\n"
-                    f"Std. dev. = {np.std(finite_values):.3f}\n"
-                    f"RMS = {np.sqrt(np.mean(finite_values**2)):.3f}"
+                statistics_text = self._format_residual_statistics(
+                    finite_values,
+                    residual_type,
                 )
                 distribution_axis.text(
                     0.03,
@@ -495,7 +804,7 @@ class PlottingResiduals:
                     f"{residual_type.capitalize()} residual"
                 )
                 distribution_axis.set_ylabel("Probability density")
-                distribution_axis.legend()
+                distribution_axis.legend(loc="upper right")
                 distribution_axis.grid(alpha=0.2)
 
         # Add one colorbar shared by both maps in its reserved axis.
@@ -523,6 +832,9 @@ class PlottingResiduals:
         projection_id: str,
         residual_type: str,
         phi_bin_index: int | None = None,
+        n_simulations: int | None = None,
+        random_seed: int | None = None,
+        show_gaussian_reference: bool = True,
     ) -> Figure:
         """Plot a PsiChi residual map, optionally for one Phi bin.
 
@@ -535,6 +847,9 @@ class PlottingResiduals:
             phi_bin_index: Phi-bin index required for
                 ``"Phi_PsiChi_projection"``; leave as ``None`` for the
                 Phi-integrated projection.
+            n_simulations: Optional number of fixed-fit Poisson realizations.
+            random_seed: Optional seed for reproducible simulations.
+            show_gaussian_reference: Whether to overlay a Gaussian reference.
 
         Returns:
             The Matplotlib figure containing the HEALPix map and distribution.
@@ -594,6 +909,16 @@ class PlottingResiduals:
         if finite_values.size == 0:
             raise ValueError("This HEALPix view has no finite residual values.")
 
+        simulation_reference = None
+        if residual_type == "pearson" and n_simulations is not None:
+            simulation_reference = self.analysis.pearson_poisson_reference(
+                projection_id,
+                n_simulations=n_simulations,
+                bins=40,
+                seed=random_seed,
+                phi_bin_index=phi_bin_index,
+            )
+
         # Center the map color scale on zero.
         color_limit = np.max(np.abs(finite_values))
         if color_limit == 0:
@@ -648,14 +973,42 @@ class PlottingResiduals:
         )
 
         # Plot the empirical residual distribution.
-        distribution_axis.hist(
-            finite_values,
-            bins=40,
-            density=True,
-            color="tab:blue",
-            alpha=0.65,
-            label=f"{residual_type.capitalize()} residuals",
-        )
+        if simulation_reference is not None:
+            bin_edges = simulation_reference["bin_edges"]
+            distribution_axis.hist(
+                finite_values,
+                bins=bin_edges,
+                density=True,
+                color="tab:blue",
+                alpha=0.55,
+                label="Observed Pearson residuals",
+            )
+            bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+            distribution_axis.stairs(
+                simulation_reference["density"],
+                bin_edges,
+                color="black",
+                linewidth=1.5,
+                label="Poisson MC mean density",
+            )
+            distribution_axis.fill_between(
+                bin_centers,
+                simulation_reference["lower"],
+                simulation_reference["upper"],
+                step="mid",
+                color="tab:orange",
+                alpha=0.25,
+                label="95% pointwise MC interval",
+            )
+        else:
+            distribution_axis.hist(
+                finite_values,
+                bins=40,
+                density=True,
+                color="tab:blue",
+                alpha=0.65,
+                label=f"{residual_type.capitalize()} residuals",
+            )
         distribution_axis.axvline(
             0.0,
             color="black",
@@ -663,7 +1016,7 @@ class PlottingResiduals:
             linewidth=1,
         )
 
-        if residual_type == "pearson":
+        if residual_type == "pearson" and show_gaussian_reference:
             # Compare Pearson residuals with the standard normal density.
             distribution_limit = max(
                 4.0,
@@ -684,12 +1037,9 @@ class PlottingResiduals:
             )
 
         # Show descriptive statistics for the finite residuals.
-        statistics_text = (
-            f"N = {finite_values.size}\n"
-            f"Mean = {np.mean(finite_values):.3f}\n"
-            f"Median = {np.median(finite_values):.3f}\n"
-            f"Std. dev. = {np.std(finite_values):.3f}\n"
-            f"RMS = {np.sqrt(np.mean(finite_values**2)):.3f}"
+        statistics_text = self._format_residual_statistics(
+            finite_values,
+            residual_type,
         )
         distribution_axis.text(
             0.03,
@@ -708,7 +1058,7 @@ class PlottingResiduals:
         )
         distribution_axis.set_xlabel(f"{residual_type.capitalize()} residual")
         distribution_axis.set_ylabel("Probability density")
-        distribution_axis.legend()
+        distribution_axis.legend(loc="upper right")
         distribution_axis.grid(alpha=0.2)
 
         figure.tight_layout()
