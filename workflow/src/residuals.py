@@ -160,6 +160,41 @@ class ResidualAnalysis:
             "expected": projected_exp,
         }
 
+    def select_energy_bin(self, energy_bin_index: int) -> "ResidualAnalysis":
+        """Create a residual analysis for one measured-energy bin.
+
+        Args:
+            energy_bin_index: Zero-based index of the Em bin to analyze.
+
+        Returns:
+            A residual analysis retaining the selected Em bin as a
+            one-bin energy axis.
+        """
+        if "Em" not in self.observed_hist.axes.labels:
+            raise ValueError("The input histograms do not contain an Em axis.")
+        if (
+            isinstance(energy_bin_index, bool)
+            or not isinstance(energy_bin_index, (int, np.integer))
+        ):
+            raise TypeError("energy_bin_index must be an integer.")
+
+        number_of_energy_bins = self.observed_hist.axes["Em"].nbins
+        if not 0 <= energy_bin_index < number_of_energy_bins:
+            raise IndexError("energy_bin_index is outside the available Em bins.")
+
+        selected_observed = self.observed_hist.slice[
+            {"Em": energy_bin_index}
+        ].copy()
+        selected_expected = self.expected_hist.slice[
+            {"Em": energy_bin_index}
+        ].copy()
+
+        return ResidualAnalysis(
+            selected_observed,
+            selected_expected,
+            expected_floor=self.expected_floor,
+        )
+
     def split_psichi_function(
         self,
         psichi_products: dict[str, Histogram],
@@ -331,7 +366,16 @@ class ResidualAnalysis:
         # Reuse the projections if they have already been built.
         if self._projected_data_cache is not None:
             return self._projected_data_cache
-    
+
+        # Require an explicit selection before making CDS projections from
+        # input containing more than one measured-energy bin.
+        has_energy_axis = "Em" in self.observed_hist.axes.labels
+        if has_energy_axis and self.observed_hist.axes["Em"].nbins > 1:
+            self._projected_data_cache = {
+                "Em_projection": self.projection_function("Em")
+            }
+            return self._projected_data_cache
+
         phi_products = self.projection_function("Phi")
         psichi_products = self.projection_function("PsiChi")
         phi_psichi_products = self.projection_function("Phi", "PsiChi")
@@ -348,6 +392,9 @@ class ResidualAnalysis:
             "Phi_Psi_projection": phi_split_products["Phi_Psi"],
             "Phi_PsiChi_projection": phi_psichi_products,
         }
+        # Add the energy projection only when the input contains an Em axis.
+        if "Em" in self.observed_hist.axes.labels:
+            projection_dictionary["Em_projection"] = self.projection_function("Em")
 
         # Save the projections so later calls can reuse them.
         self._projected_data_cache = projection_dictionary
@@ -448,6 +495,7 @@ class ResidualAnalysis:
         )
 
         direct_axes = {
+            "Em_projection": ("Em",),
             "Phi_projection": ("Phi",),
             "PsiChi_projection": ("PsiChi",),
             "Phi_PsiChi_projection": ("Phi", "PsiChi"),
@@ -710,6 +758,13 @@ class ResidualAnalysis:
             raise ValueError(
                 "Unknown residual type. Choose 'raw', 'pearson', "
                 "or 'fractional'."
+            )
+        if (
+            "Em" in self.observed_hist.axes.labels
+            and self.observed_hist.axes["Em"].nbins > 1
+        ):
+            raise ValueError(
+                "Select one Em bin before calculating full-CDS statistics."
             )
 
         observed = np.asarray(self.observed_hist.contents[self.mask], dtype=float)

@@ -18,6 +18,7 @@ class PlottingResiduals:
     """
 
     _PEARSON_REFERENCE_BINS = {
+        "Em_projection": 15,
         "Phi_projection": 15,
         "Chi_projection": 15,
         "Psi_projection": 15,
@@ -223,6 +224,7 @@ class PlottingResiduals:
 
         # Route supported one-dimensional projections to their plotter.
         one_dimensional_ids = {
+            "Em_projection",
             "Phi_projection",
             "Chi_projection",
             "Psi_projection",
@@ -285,7 +287,11 @@ class PlottingResiduals:
         # Get the single coordinate axis from this one-dimensional histogram.
         axis_name = observed_hist.axes.labels[0]
         axis = observed_hist.axes[axis_name]
-        x_values = axis.centers.to_value(u.deg)
+        # Use the native unit of the selected histogram axis.
+        axis_unit = axis.centers.unit
+        x_values = axis.centers.to_value(axis_unit)
+        # Use the true bin boundaries for step plots.
+        bin_edges = axis.edges.to_value(axis_unit)
 
         # Get the counts and residual values from the input histograms.
         observed_values = observed_hist.contents
@@ -317,29 +323,28 @@ class PlottingResiduals:
             raise ValueError(f"Unknown residual type: {residual_type}")
 
         # Compare the projected observed and expected counts.
-        counts_axis.step(
-            x_values,
+        counts_axis.stairs(
             observed_values,
-            where="mid",
+            bin_edges,
             color="black",
             linewidth=1.5,
             label="Observed",
         )
         # Show the nominal one-sigma Poisson uncertainty around the prediction.
         poisson_sigma = np.sqrt(expected_values)
-        counts_axis.fill_between(
-            x_values,
-            expected_values - poisson_sigma,
+        # Draw the Poisson band using the true histogram boundaries.
+        counts_axis.stairs(
             expected_values + poisson_sigma,
-            step="mid",
+            bin_edges,
+            baseline=expected_values - poisson_sigma,
+            fill=True,
             color="tab:orange",
             alpha=0.3,
             label=r"Poisson uncertainty ($\pm 1\sigma$)",
         )
-        counts_axis.step(
-            x_values,
+        counts_axis.stairs(
             expected_values,
-            where="mid",
+            bin_edges,
             color="red",
             linewidth=1.5,
             linestyle=":",
@@ -380,7 +385,7 @@ class PlottingResiduals:
             linestyle="--",
         )
 
-        residual_axis.set_xlabel(f"{axis_name} [deg]")
+        residual_axis.set_xlabel(f"{axis_name} [{axis_unit}]")
         residual_axis.set_ylabel(f"{residual_type.capitalize()} residual")
         residual_axis.grid(alpha=0.2)
 
