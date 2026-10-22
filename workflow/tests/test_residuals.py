@@ -504,8 +504,8 @@ def test_public_projection_and_pearson_workflow_preserves_aggregated_counts():
     )
 
 
-def test_multi_energy_projection_aggregates_cds_before_residual():
-    """Energy residuals use CDS counts aggregated within each Em bin."""
+def test_multi_energy_projection_preserves_energy_in_cds_views():
+    """Energy-resolved CDS projections retain every original Em bin."""
     em_axis = Axis([300.0, 400.0, 600.0], label="Em", unit=u.keV)
     phi_axis = Axis([0.0, 1.0, 2.0], label="Phi", unit=u.deg)
     psichi_axis = HealpixAxis(nside=1, coordsys="C", label="PsiChi")
@@ -527,6 +527,13 @@ def test_multi_energy_projection_aggregates_cds_before_residual():
     raw_residual = analysis.residual_function("Em_projection", "raw")
     expected_observed_counts = observed_values.sum(axis=(1, 2))
     expected_model_counts = expected_values.sum(axis=(1, 2))
+    expected_projection_ids = {
+        "Em_projection",
+        "Em_Phi_projection",
+        "Em_Chi_projection",
+        "Em_Psi_projection",
+        "Em_PsiChi_projection",
+    }
 
     assert list(em_products["observed"].axes.labels) == ["Em"]
     np.testing.assert_allclose(
@@ -541,11 +548,109 @@ def test_multi_energy_projection_aggregates_cds_before_residual():
         raw_residual.contents,
         expected_observed_counts - expected_model_counts,
     )
-    assert set(projected_data) == {"Em_projection"}
+    assert set(projected_data) == expected_projection_ids
+
+    np.testing.assert_allclose(
+        projected_data["Em_Phi_projection"]["observed"].contents,
+        observed_values.sum(axis=2),
+    )
+    np.testing.assert_allclose(
+        projected_data["Em_Phi_projection"]["expected"].contents,
+        expected_values.sum(axis=2),
+    )
+    np.testing.assert_allclose(
+        projected_data["Em_PsiChi_projection"]["observed"].contents,
+        observed_values.sum(axis=1),
+    )
+
+    original_totals_by_energy = observed_values.sum(axis=(1, 2))
+    for projection_id in ("Em_Chi_projection", "Em_Psi_projection"):
+        np.testing.assert_allclose(
+            projected_data[projection_id]["observed"].contents.sum(axis=1),
+            original_totals_by_energy,
+        )
 
 
-def test_select_energy_bin_preserves_only_selected_cds_counts():
-    """A selected Em bin supplies all CDS projections without integration."""
+def test_multi_energy_residuals_and_plots_use_new_projection_ids(monkeypatch):
+    """Energy-resolved products use existing residual and plotting interfaces."""
+    monkeypatch.setattr(plt, "show", lambda: None)
+    em_axis = Axis([300.0, 400.0, 600.0], label="Em", unit=u.keV)
+    phi_axis = Axis([0.0, 1.0, 2.0], label="Phi", unit=u.deg)
+    psichi_axis = HealpixAxis(nside=1, coordsys="C", label="PsiChi")
+    expected_values = np.full((2, 2, 12), 4.0)
+    observed_values = expected_values + 2.0
+    analysis = ResidualAnalysis(
+        Histogram(
+            [em_axis, phi_axis, psichi_axis],
+            contents=observed_values,
+        ),
+        Histogram(
+            [em_axis, phi_axis, psichi_axis],
+            contents=expected_values,
+        ),
+    )
+    plotting = PlottingResiduals(analysis)
+
+    for projection_id in (
+        "Em_Phi_projection",
+        "Em_Chi_projection",
+        "Em_Psi_projection",
+    ):
+        residual = analysis.residual_function(projection_id, "pearson")
+        assert np.any(np.isfinite(residual.contents))
+        assert not np.any(np.isinf(residual.contents))
+        figure = plotting.plot(projection_id, residual_type="pearson")
+        assert figure is not None
+        plt.close(figure)
+
+    with pytest.raises(ValueError, match="Provide energy_bin_index"):
+        plotting.plot("Em_PsiChi_projection", residual_type="raw")
+
+    figure = plotting.plot(
+        "Em_PsiChi_projection",
+        residual_type="raw",
+        energy_bin_index=1,
+    )
+    assert figure is not None
+    plt.close(figure)
+
+
+def test_multi_energy_psichi_plot_supports_poisson_reference(monkeypatch):
+    """An Em-PsiChi slice reuses the fixed-fit Pearson simulation pipeline."""
+    monkeypatch.setattr(plt, "show", lambda: None)
+    em_axis = Axis([300.0, 400.0, 600.0], label="Em", unit=u.keV)
+    phi_axis = Axis([0.0, 1.0, 2.0], label="Phi", unit=u.deg)
+    psichi_axis = HealpixAxis(nside=1, coordsys="C", label="PsiChi")
+    expected_values = np.full((2, 2, 12), 4.0)
+    analysis = ResidualAnalysis(
+        Histogram(
+            [em_axis, phi_axis, psichi_axis],
+            contents=expected_values.copy(),
+        ),
+        Histogram(
+            [em_axis, phi_axis, psichi_axis],
+            contents=expected_values,
+        ),
+    )
+    plotting = PlottingResiduals(
+        analysis,
+        n_simulations=2,
+        random_seed=42,
+        energy_bin_index=1,
+    )
+
+    figure = plotting.plot(
+        "Em_PsiChi_projection",
+        residual_type="pearson",
+    )
+
+    assert figure is not None
+    assert len(analysis._poisson_reference_cache) == 5
+    plt.close(figure)
+
+
+def test_select_energy_range_aggregates_selected_cds_counts():
+    """An energy interval is aggregated before making CDS projections."""
     em_axis = Axis([300.0, 400.0, 600.0], label="Em", unit=u.keV)
     phi_axis = Axis([0.0, 1.0, 2.0], label="Phi", unit=u.deg)
     psichi_axis = HealpixAxis(nside=1, coordsys="C", label="PsiChi")
@@ -562,7 +667,7 @@ def test_select_energy_bin_preserves_only_selected_cds_counts():
         ),
     )
 
-    selected_analysis = analysis.select_energy_bin(1)
+    selected_analysis = analysis.select_energy_range(300.0, 600.0)
     selected_products = selected_analysis.projected_data()
 
     assert list(selected_analysis.observed_hist.axes.labels) == [
@@ -573,17 +678,25 @@ def test_select_energy_bin_preserves_only_selected_cds_counts():
     assert selected_analysis.observed_hist.shape == (1, 2, 12)
     np.testing.assert_allclose(
         selected_analysis.observed_hist.contents,
-        observed_values[1:2],
+        observed_values.sum(axis=0, keepdims=True),
+    )
+    np.testing.assert_allclose(
+        selected_analysis.expected_hist.contents,
+        expected_values.sum(axis=0, keepdims=True),
     )
     np.testing.assert_allclose(
         selected_products["Phi_projection"]["observed"].contents,
-        observed_values[1].sum(axis=1),
+        observed_values.sum(axis=(0, 2)),
+    )
+    np.testing.assert_allclose(
+        selected_products["Phi_projection"]["expected"].contents,
+        expected_values.sum(axis=(0, 2)),
     )
     assert selected_products["Em_projection"]["observed"].shape == (1,)
 
 
-def test_select_energy_bin_validates_index_and_preserves_energy_edges():
-    """Energy selection validates indices and retains the chosen Em interval."""
+def test_select_energy_range_validates_limits_and_preserves_energy_edges():
+    """Energy selection validates and retains exact Em edge intervals."""
     em_axis = Axis([300.0, 400.0, 600.0], label="Em", unit=u.keV)
     phi_axis = Axis([0.0, 1.0, 2.0], label="Phi", unit=u.deg)
     psichi_axis = HealpixAxis(nside=1, coordsys="C", label="PsiChi")
@@ -594,32 +707,32 @@ def test_select_energy_bin_validates_index_and_preserves_energy_edges():
     )
     analysis = ResidualAnalysis(histogram, histogram.copy())
 
-    for energy_bin_index in range(2):
-        selected = analysis.select_energy_bin(energy_bin_index)
+    for energy_min, energy_max in ((300.0, 400.0), (400.0, 600.0)):
+        selected = analysis.select_energy_range(energy_min, energy_max)
         np.testing.assert_allclose(
             selected.observed_hist.axes["Em"].edges.to_value(u.keV),
-            em_axis.edges[energy_bin_index : energy_bin_index + 2].to_value(u.keV),
+            [energy_min, energy_max],
         )
 
-    with pytest.raises(TypeError, match="must be an integer"):
-        analysis.select_energy_bin(True)
-    with pytest.raises(TypeError, match="must be an integer"):
-        analysis.select_energy_bin(0.5)
-    with pytest.raises(IndexError, match="outside the available Em bins"):
-        analysis.select_energy_bin(-1)
-    with pytest.raises(IndexError, match="outside the available Em bins"):
-        analysis.select_energy_bin(2)
+    with pytest.raises(TypeError, match="must be numeric values"):
+        analysis.select_energy_range(True, 400.0)
+    with pytest.raises(ValueError, match="must be finite"):
+        analysis.select_energy_range(300.0, np.inf)
+    with pytest.raises(ValueError, match="must be smaller"):
+        analysis.select_energy_range(400.0, 300.0)
+    with pytest.raises(ValueError, match="Available edges in keV"):
+        analysis.select_energy_range(350.0, 600.0)
 
     no_energy_analysis = ResidualAnalysis(
         make_histogram([1.0, 1.0]),
         make_histogram([1.0, 1.0]),
     )
     with pytest.raises(ValueError, match="do not contain an Em axis"):
-        no_energy_analysis.select_energy_bin(0)
+        no_energy_analysis.select_energy_range(300.0, 400.0)
 
 
-def test_selected_energy_statistics_use_only_the_chosen_bin():
-    """Full-CDS summaries exclude every unselected measured-energy bin."""
+def test_selected_energy_statistics_use_only_the_selected_range():
+    """Full-CDS summaries exclude counts outside the selected energy range."""
     em_axis = Axis([300.0, 400.0, 600.0], label="Em", unit=u.keV)
     phi_axis = Axis([0.0, 1.0, 2.0], label="Phi", unit=u.deg)
     psichi_axis = HealpixAxis(nside=1, coordsys="C", label="PsiChi")
@@ -637,10 +750,13 @@ def test_selected_energy_statistics_use_only_the_chosen_bin():
         ),
     )
 
-    with pytest.raises(ValueError, match="Select one Em bin"):
+    with pytest.raises(ValueError, match="Select an energy interval"):
         analysis.statistics_table("pearson")
 
-    selected_table = analysis.select_energy_bin(1).statistics_table("pearson")
+    selected_table = analysis.select_energy_range(
+        400.0,
+        600.0,
+    ).statistics_table("pearson")
 
     assert selected_table.loc[0, "Valid bins (N)"] == 24
     assert selected_table.loc[0, "Mean residual"] == pytest.approx(1.0)
@@ -648,7 +764,7 @@ def test_selected_energy_statistics_use_only_the_chosen_bin():
 
 
 def test_selected_energy_poisson_draw_uses_only_selected_expectation(monkeypatch):
-    """Poisson simulations draw from only the selected Em-bin expectation."""
+    """Poisson simulations use only the selected energy-range expectation."""
     em_axis = Axis([300.0, 400.0, 600.0], label="Em", unit=u.keV)
     phi_axis = Axis([0.0, 1.0, 2.0], label="Phi", unit=u.deg)
     psichi_axis = HealpixAxis(nside=1, coordsys="C", label="PsiChi")
@@ -660,7 +776,7 @@ def test_selected_energy_poisson_draw_uses_only_selected_expectation(monkeypatch
         contents=expected_values,
     )
     analysis = ResidualAnalysis(expected.copy(), expected)
-    selected = analysis.select_energy_bin(1)
+    selected = analysis.select_energy_range(400.0, 600.0)
     poisson_inputs = []
 
     class RecordingGenerator:
@@ -699,14 +815,20 @@ def test_single_energy_bin_preserves_existing_cds_projections():
         contents=values,
     )
 
-    projected_data = ResidualAnalysis(
+    analysis = ResidualAnalysis(
         histogram,
         histogram.copy(),
-    ).projected_data()
+    )
+    projected_data = analysis.projected_data()
+    selected_analysis = analysis.select_energy_range(509.0, 513.0)
 
     assert "Em_projection" in projected_data
     assert "Phi_projection" in projected_data
     assert "PsiChi_projection" in projected_data
+    np.testing.assert_allclose(
+        selected_analysis.observed_hist.contents,
+        histogram.contents,
+    )
 
 
 def test_energy_plot_uses_native_units_and_true_bin_edges(monkeypatch):

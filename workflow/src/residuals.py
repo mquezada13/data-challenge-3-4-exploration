@@ -160,34 +160,108 @@ class ResidualAnalysis:
             "expected": projected_exp,
         }
 
-    def select_energy_bin(self, energy_bin_index: int) -> "ResidualAnalysis":
-        """Create a residual analysis for one measured-energy bin.
+    def select_energy_range(
+        self,
+        energy_min: float,
+        energy_max: float,
+    ) -> "ResidualAnalysis":
+        """Create a residual analysis for an exact measured-energy interval.
+
+        The requested limits must coincide with existing Em bin edges.
 
         Args:
-            energy_bin_index: Zero-based index of the Em bin to analyze.
+            energy_min: Lower energy boundary in keV.
+            energy_max: Upper energy boundary in keV.
 
         Returns:
-            A residual analysis retaining the selected Em bin as a
-            one-bin energy axis.
+            A residual analysis with all selected Em bins aggregated into
+            one energy bin.
         """
         if "Em" not in self.observed_hist.axes.labels:
             raise ValueError("The input histograms do not contain an Em axis.")
+
+        numeric_types = (int, float, np.integer, np.floating)
         if (
-            isinstance(energy_bin_index, bool)
-            or not isinstance(energy_bin_index, (int, np.integer))
+            isinstance(energy_min, bool)
+            or isinstance(energy_max, bool)
+            or not isinstance(energy_min, numeric_types)
+            or not isinstance(energy_max, numeric_types)
         ):
-            raise TypeError("energy_bin_index must be an integer.")
+            raise TypeError(
+                "energy_min and energy_max must be numeric values in keV."
+            )
 
-        number_of_energy_bins = self.observed_hist.axes["Em"].nbins
-        if not 0 <= energy_bin_index < number_of_energy_bins:
-            raise IndexError("energy_bin_index is outside the available Em bins.")
+        energy_min = float(energy_min)
+        energy_max = float(energy_max)
 
-        selected_observed = self.observed_hist.slice[
-            {"Em": energy_bin_index}
-        ].copy()
-        selected_expected = self.expected_hist.slice[
-            {"Em": energy_bin_index}
-        ].copy()
+        if not np.isfinite(energy_min) or not np.isfinite(energy_max):
+            raise ValueError("energy_min and energy_max must be finite.")
+        if energy_min >= energy_max:
+            raise ValueError("energy_min must be smaller than energy_max.")
+
+        energy_axis = self.observed_hist.axes["Em"]
+        energy_edges = energy_axis.edges.to_value(u.keV)
+        available_edges = ", ".join(f"{edge:g}" for edge in energy_edges)
+
+        # Locate limits that coincide with existing energy-bin edges.
+        lower_matches = np.flatnonzero(
+            np.isclose(energy_edges, energy_min, rtol=0.0, atol=1e-9)
+        )
+        upper_matches = np.flatnonzero(
+            np.isclose(energy_edges, energy_max, rtol=0.0, atol=1e-9)
+        )
+
+        if lower_matches.size == 0 or upper_matches.size == 0:
+            raise ValueError(
+                "energy_min and energy_max must match existing Em bin edges. "
+                f"Available edges in keV: [{available_edges}]"
+            )
+
+        lower_edge_index = int(lower_matches[0])
+        upper_edge_index = int(upper_matches[0])
+
+        if lower_edge_index >= upper_edge_index:
+            raise ValueError(
+                "energy_min must correspond to an edge below energy_max."
+            )
+
+        # Select the same energy bins from observed and expected counts.
+        energy_axis_index = list(self.observed_hist.axes.labels).index("Em")
+        selection = [slice(None)] * self.observed_hist.ndim
+        selection[energy_axis_index] = slice(
+            lower_edge_index,
+            upper_edge_index,
+        )
+        selection = tuple(selection)
+
+        # Aggregate the selected energy bins while retaining a length-one Em axis.
+        selected_observed_contents = np.sum(
+            self.masked_observed_hist.contents[selection],
+            axis=energy_axis_index,
+            keepdims=True,
+        )
+        selected_expected_contents = np.sum(
+            self.masked_expected_hist.contents[selection],
+            axis=energy_axis_index,
+            keepdims=True,
+        )
+
+        selected_axes = list(self.observed_hist.axes)
+        selected_axes[energy_axis_index] = Axis(
+            [energy_min, energy_max],
+            label="Em",
+            scale=energy_axis.axis_scale,
+            unit=u.keV,
+        )
+
+        selected_observed = Histogram(
+            selected_axes,
+            contents=selected_observed_contents,
+        )
+        selected_expected = Histogram(
+            selected_axes,
+            contents=selected_expected_contents,
+        )
 
         return ResidualAnalysis(
             selected_observed,
@@ -207,19 +281,23 @@ class ResidualAnalysis:
             bin_width: Angular bin width in degrees for Chi and Psi.
 
         Returns:
-            Chi and Psi products, retaining Phi when it is present.
+            Chi and Psi products, retaining every non-PsiChi axis.
         """
         if not psichi_products:
             raise ValueError("Provide at least one PsiChi histogram to split.")
 
-        # Use the first product to get the shared HEALPix and optional Phi axes.
+        # Use the first product to get the shared HEALPix and retained axes.
         reference_histogram = next(iter(psichi_products.values()))
         psichi_axis = reference_histogram.axes["PsiChi"]
-        has_phi = "Phi" in reference_histogram.axes.labels
-
-        # Keep the Phi axis when it is present in the projection.
-        if has_phi:
-            phi_axis = reference_histogram.axes["Phi"]
+        retained_axis_names = [
+            axis_name
+            for axis_name in reference_histogram.axes.labels
+            if axis_name != "PsiChi"
+        ]
+        retained_axes = [
+            reference_histogram.axes[axis_name]
+            for axis_name in retained_axis_names
+        ]
 
         # Get the index of every HEALPix pixel.
         psichi_pixels = np.arange(psichi_axis.npix)
@@ -282,44 +360,35 @@ class ResidualAnalysis:
                 dtype=float,
             )
 
-            if has_phi:
-                # Rebin each Phi row separately and preserve the Phi axis.
-                chi_values = np.stack(
-                    [
-                        np.histogram(
-                            chi_centers,
-                            bins=chi_edges,
-                            weights=phi_row,
-                        )[0]
-                        for phi_row in values
-                    ]
-                )
-                psi_values = np.stack(
-                    [
-                        np.histogram(
-                            psi_centers,
-                            bins=psi_edges,
-                            weights=phi_row,
-                        )[0]
-                        for phi_row in values
-                    ]
-                )
-                chi_axes = [phi_axis, chi_axis]
-                psi_axes = [phi_axis, psi_axis]
-            else:
-                # Rebin the one-dimensional PsiChi histogram directly.
-                chi_values, _ = np.histogram(
-                    chi_centers,
-                    bins=chi_edges,
-                    weights=values,
-                )
-                psi_values, _ = np.histogram(
-                    psi_centers,
-                    bins=psi_edges,
-                    weights=values,
-                )
-                chi_axes = [chi_axis]
-                psi_axes = [psi_axis]
+            psichi_axis_index = list(histogram.axes.labels).index("PsiChi")
+            values_by_pixel = np.moveaxis(values, psichi_axis_index, -1)
+            retained_shape = values_by_pixel.shape[:-1]
+            flattened_values = values_by_pixel.reshape(-1, psichi_axis.npix)
+
+            # Rebin every retained-axis row using the same sky coordinates.
+            chi_values = np.stack(
+                [
+                    np.histogram(
+                        chi_centers,
+                        bins=chi_edges,
+                        weights=row,
+                    )[0]
+                    for row in flattened_values
+                ]
+            ).reshape(*retained_shape, len(chi_edges) - 1)
+            psi_values = np.stack(
+                [
+                    np.histogram(
+                        psi_centers,
+                        bins=psi_edges,
+                        weights=row,
+                    )[0]
+                    for row in flattened_values
+                ]
+            ).reshape(*retained_shape, len(psi_edges) - 1)
+
+            chi_axes = [*retained_axes, chi_axis]
+            psi_axes = [*retained_axes, psi_axis]
 
             chi_products[product_name] = Histogram(
                 chi_axes,
@@ -348,15 +417,12 @@ class ResidualAnalysis:
                     f"The Psi separation does not preserve {product_name}."
                 )
 
-        if has_phi:
-            return {
-                "Phi_Chi": chi_products,
-                "Phi_Psi": psi_products,
-            }
-
+        axis_prefix = "_".join(retained_axis_names)
+        chi_name = f"{axis_prefix}_Chi" if axis_prefix else "Chi"
+        psi_name = f"{axis_prefix}_Psi" if axis_prefix else "Psi"
         return {
-            "Chi": chi_products,
-            "Psi": psi_products,
+            chi_name: chi_products,
+            psi_name: psi_products,
         }
 
 
@@ -367,12 +433,18 @@ class ResidualAnalysis:
         if self._projected_data_cache is not None:
             return self._projected_data_cache
 
-        # Require an explicit selection before making CDS projections from
-        # input containing more than one measured-energy bin.
+        # Require an explicit energy interval before making CDS projections
+        # from input containing more than one measured-energy bin.
         has_energy_axis = "Em" in self.observed_hist.axes.labels
         if has_energy_axis and self.observed_hist.axes["Em"].nbins > 1:
+            em_psichi_products = self.projection_function("Em", "PsiChi")
+            em_split_products = self.split_psichi_function(em_psichi_products)
             self._projected_data_cache = {
-                "Em_projection": self.projection_function("Em")
+                "Em_projection": self.projection_function("Em"),
+                "Em_Phi_projection": self.projection_function("Em", "Phi"),
+                "Em_Chi_projection": em_split_products["Em_Chi"],
+                "Em_Psi_projection": em_split_products["Em_Psi"],
+                "Em_PsiChi_projection": em_psichi_products,
             }
             return self._projected_data_cache
 
@@ -496,11 +568,15 @@ class ResidualAnalysis:
 
         direct_axes = {
             "Em_projection": ("Em",),
+            "Em_Phi_projection": ("Em", "Phi"),
+            "Em_PsiChi_projection": ("Em", "PsiChi"),
             "Phi_projection": ("Phi",),
             "PsiChi_projection": ("PsiChi",),
             "Phi_PsiChi_projection": ("Phi", "PsiChi"),
         }
         split_axes = {
+            "Em_Chi_projection": (("Em", "PsiChi"), "Em_Chi"),
+            "Em_Psi_projection": (("Em", "PsiChi"), "Em_Psi"),
             "Chi_projection": (("PsiChi",), "Chi"),
             "Psi_projection": (("PsiChi",), "Psi"),
             "Phi_Chi_projection": (("Phi", "PsiChi"), "Phi_Chi"),
@@ -527,6 +603,7 @@ class ResidualAnalysis:
         bins: int = 15,
         seed: int | None = None,
         phi_bin_index: int | None = None,
+        energy_bin_index: int | None = None,
     ) -> dict[str, np.ndarray | int]:
         """Get a simulated Pearson reference for one projection."""
         references = self.prepare_pearson_poisson_references(
@@ -538,8 +615,18 @@ class ResidualAnalysis:
                 if phi_bin_index is not None
                 else None
             ),
+            energy_bin_indices=(
+                {projection_id: energy_bin_index}
+                if energy_bin_index is not None
+                else None
+            ),
         )
-        return references[(projection_id, phi_bin_index)]
+        slice_index = (
+            phi_bin_index
+            if phi_bin_index is not None
+            else energy_bin_index
+        )
+        return references[(projection_id, slice_index)]
 
     def prepare_pearson_poisson_references(
         self,
@@ -547,6 +634,7 @@ class ResidualAnalysis:
         n_simulations: int = 1000,
         seed: int | None = None,
         phi_bin_indices: dict[str, int] | None = None,
+        energy_bin_indices: dict[str, int] | None = None,
     ) -> dict[tuple[str, int | None], dict[str, np.ndarray | int]]:
         """Prepare references for several plots from shared CDS simulations.
 
@@ -563,11 +651,15 @@ class ResidualAnalysis:
             seed: Optional seed for reproducibility.
             phi_bin_indices: Optional Phi-bin index for each requested
                 ``"Phi_PsiChi_projection"`` slice.
+            energy_bin_indices: Optional Em-bin index for each requested
+                ``"Em_PsiChi_projection"`` slice.
 
         Returns:
-            References keyed by ``(projection_id, phi_bin_index)``. Each
-            reference contains common ``bin_edges``, mean ``density``,
-            pointwise 95% ``lower`` and ``upper`` limits, and the seed used.
+            References keyed by ``(projection_id, slice_index)``. The slice
+            index is a Phi index for ``Phi_PsiChi_projection``, an Em index for
+            ``Em_PsiChi_projection``, and ``None`` otherwise. Each reference
+            contains common ``bin_edges``, mean ``density``, pointwise 95%
+            ``lower`` and ``upper`` limits, and the seed used.
 
         Notes:
             This fixed-fit reference is not a goodness-of-fit test. The
@@ -584,6 +676,7 @@ class ResidualAnalysis:
             raise ValueError("Provide at least one projection to simulate.")
 
         phi_bin_indices = phi_bin_indices or {}
+        energy_bin_indices = energy_bin_indices or {}
         projected_data = self.projected_data()
         effective_seed = (
             int(seed)
@@ -600,14 +693,39 @@ class ResidualAnalysis:
                 raise ValueError(f"Unknown projection: {projection_id}")
 
             phi_bin_index = phi_bin_indices.get(projection_id)
+            energy_bin_index = energy_bin_indices.get(projection_id)
+            if phi_bin_index is not None and energy_bin_index is not None:
+                raise ValueError(
+                    "A projection cannot use both Phi and Em slice indices."
+                )
             if phi_bin_index is not None and projection_id != "Phi_PsiChi_projection":
                 raise ValueError(
                     "phi_bin_indices applies only to Phi_PsiChi_projection."
+                )
+            if (
+                energy_bin_index is not None
+                and projection_id != "Em_PsiChi_projection"
+            ):
+                raise ValueError(
+                    "energy_bin_indices applies only to Em_PsiChi_projection."
                 )
             if projection_id == "Phi_PsiChi_projection" and phi_bin_index is None:
                 raise ValueError(
                     "Provide a Phi-bin index for Phi_PsiChi_projection."
                 )
+            if (
+                projection_id == "Em_PsiChi_projection"
+                and energy_bin_index is None
+            ):
+                raise ValueError(
+                    "Provide an Em-bin index for Em_PsiChi_projection."
+                )
+
+            slice_index = (
+                phi_bin_index
+                if phi_bin_index is not None
+                else energy_bin_index
+            )
 
             cache_key = (
                 projection_id,
@@ -615,8 +733,9 @@ class ResidualAnalysis:
                 bins,
                 effective_seed,
                 phi_bin_index,
+                energy_bin_index,
             )
-            reference_key = (projection_id, phi_bin_index)
+            reference_key = (projection_id, slice_index)
             if cache_key in self._poisson_reference_cache:
                 references[reference_key] = self._poisson_reference_cache[cache_key]
                 continue
@@ -636,6 +755,13 @@ class ResidualAnalysis:
                     )
                 expected_values = expected_values[phi_bin_index]
                 observed_values = observed_values[phi_bin_index]
+            elif energy_bin_index is not None:
+                if not 0 <= energy_bin_index < expected_values.shape[0]:
+                    raise IndexError(
+                        "energy_bin_index is outside the available Em bins."
+                    )
+                expected_values = expected_values[energy_bin_index]
+                observed_values = observed_values[energy_bin_index]
 
             valid_mask = expected_values > 0
             observed_values = observed_values[np.isfinite(observed_values)]
@@ -645,6 +771,7 @@ class ResidualAnalysis:
             requests[reference_key] = {
                 "projection_id": projection_id,
                 "phi_bin_index": phi_bin_index,
+                "energy_bin_index": energy_bin_index,
                 "bins": bins,
                 "expected": expected_values,
                 "valid_mask": valid_mask,
@@ -659,7 +786,7 @@ class ResidualAnalysis:
             return references
 
         expected_full = np.asarray(
-            self.expected_hist.contents,
+            self.masked_expected_hist.contents,
             dtype=float,
         )
 
@@ -678,6 +805,10 @@ class ResidualAnalysis:
             )
             if request["phi_bin_index"] is not None:
                 projected_counts = projected_counts[request["phi_bin_index"]]
+            elif request["energy_bin_index"] is not None:
+                projected_counts = projected_counts[
+                    request["energy_bin_index"]
+                ]
             expected_values = request["expected"]
             valid_mask = request["valid_mask"]
             return (
@@ -764,11 +895,18 @@ class ResidualAnalysis:
             and self.observed_hist.axes["Em"].nbins > 1
         ):
             raise ValueError(
-                "Select one Em bin before calculating full-CDS statistics."
+                "Select an energy interval before calculating full-CDS "
+                "statistics."
             )
 
-        observed = np.asarray(self.observed_hist.contents[self.mask], dtype=float)
-        expected = np.asarray(self.expected_hist.contents[self.mask], dtype=float)
+        observed = np.asarray(
+            self.masked_observed_hist.contents[self.mask],
+            dtype=float,
+        )
+        expected = np.asarray(
+            self.masked_expected_hist.contents[self.mask],
+            dtype=float,
+        )
         difference = observed - expected
 
         if residual_type == "raw":

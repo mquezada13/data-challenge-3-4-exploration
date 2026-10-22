@@ -19,6 +19,10 @@ class PlottingResiduals:
 
     _PEARSON_REFERENCE_BINS = {
         "Em_projection": 15,
+        "Em_Phi_projection": 40,
+        "Em_Chi_projection": 40,
+        "Em_Psi_projection": 40,
+        "Em_PsiChi_projection": 40,
         "Phi_projection": 15,
         "Chi_projection": 15,
         "Psi_projection": 15,
@@ -34,6 +38,7 @@ class PlottingResiduals:
         n_simulations: int | None = None,
         random_seed: int | None = None,
         phi_bin_index: int | None = None,
+        energy_bin_index: int | None = None,
     ) -> None:
         """Store the analysis and optional Pearson simulation settings.
 
@@ -45,22 +50,40 @@ class PlottingResiduals:
             random_seed: Optional seed shared by the simulated references.
             phi_bin_index: Optional Phi slice prepared with the other
                 references and used by ``Phi_PsiChi_projection`` by default.
+            energy_bin_index: Optional Em slice used by
+                ``Em_PsiChi_projection`` by default.
         """
         self.analysis = analysis
         self.n_simulations = n_simulations
         self.random_seed = random_seed
         self.phi_bin_index = phi_bin_index
+        self.energy_bin_index = energy_bin_index
         self._generated_seed = None
         self._prepared_reference_configs = set()
+
+    def _format_energy_interval_suffix(self) -> str:
+        """Format the analysis energy interval for angular plot titles."""
+        observed_hist = self.analysis.observed_hist
+        if "Em" not in observed_hist.axes.labels:
+            return ""
+
+        energy_edges = observed_hist.axes["Em"].edges.to_value(u.keV)
+        return f" — {energy_edges[0]:g}–{energy_edges[-1]:g} keV"
 
     def _prepare_pearson_references(
         self,
         n_simulations: int,
         random_seed: int,
         phi_bin_index: int | None,
+        energy_bin_index: int | None,
     ) -> None:
         """Prepare and cache the supported Pearson references once per setup."""
-        configuration = (n_simulations, random_seed, phi_bin_index)
+        configuration = (
+            n_simulations,
+            random_seed,
+            phi_bin_index,
+            energy_bin_index,
+        )
         if configuration in self._prepared_reference_configs:
             return
 
@@ -73,10 +96,19 @@ class PlottingResiduals:
                 projection_id != "Phi_PsiChi_projection"
                 or phi_bin_index is not None
             )
+            and (
+                projection_id != "Em_PsiChi_projection"
+                or energy_bin_index is not None
+            )
         }
         phi_bin_indices = (
             {"Phi_PsiChi_projection": phi_bin_index}
             if "Phi_PsiChi_projection" in projection_bins
+            else None
+        )
+        energy_bin_indices = (
+            {"Em_PsiChi_projection": energy_bin_index}
+            if "Em_PsiChi_projection" in projection_bins
             else None
         )
         self.analysis.prepare_pearson_poisson_references(
@@ -84,6 +116,7 @@ class PlottingResiduals:
             n_simulations=n_simulations,
             seed=random_seed,
             phi_bin_indices=phi_bin_indices,
+            energy_bin_indices=energy_bin_indices,
         )
         self._prepared_reference_configs.add(configuration)
 
@@ -103,6 +136,7 @@ class PlottingResiduals:
         n_simulations: int | None = None,
         random_seed: int | None = None,
         show_gaussian_reference: bool | None = None,
+        energy_bin_index: int | None = None,
     ) -> Figure:
         """Create a residual figure for a selected projection.
 
@@ -126,13 +160,17 @@ class PlottingResiduals:
             show_gaussian_reference: Whether to overlay the theoretical
                 standard normal curve. By default it is shown without
                 simulations and hidden when simulations are requested.
+            energy_bin_index: Em-bin index for a slice of
+                ``"Em_PsiChi_projection"``.
 
         Returns:
             The Matplotlib figure containing the requested diagnostic.
 
         Raises:
-            ValueError: If the projection is unknown or a Phi index is required.
-            IndexError: If ``phi_bin_index`` is outside the available Phi bins.
+            ValueError: If the projection is unknown or a required slice index
+                is missing.
+            IndexError: If a Phi or Em slice index is outside the available
+                bins.
             NotImplementedError: If the projection does not have a plotter.
         """
         projected_data = self.analysis.projected_data()
@@ -150,7 +188,9 @@ class PlottingResiduals:
                 )
 
         if n_simulations is not None and residual_type != "pearson":
-            raise ValueError("Poisson simulations are only available for Pearson residuals.")
+            raise ValueError(
+                "Poisson simulations are only available for Pearson residuals."
+            )
         if show_gaussian_reference is not None and residual_type != "pearson":
             raise ValueError(
                 "show_gaussian_reference is only available for Pearson residuals."
@@ -158,10 +198,15 @@ class PlottingResiduals:
         plot_n_simulations = None
         plot_random_seed = None
         reference_phi_bin_index = self.phi_bin_index
+        reference_energy_bin_index = self.energy_bin_index
         if projection_id == "Phi_PsiChi_projection":
             if phi_bin_index is None:
                 phi_bin_index = self.phi_bin_index
             reference_phi_bin_index = phi_bin_index
+        if projection_id == "Em_PsiChi_projection":
+            if energy_bin_index is None:
+                energy_bin_index = self.energy_bin_index
+            reference_energy_bin_index = energy_bin_index
         if residual_type == "pearson":
             plot_n_simulations = (
                 n_simulations if n_simulations is not None else self.n_simulations
@@ -180,6 +225,7 @@ class PlottingResiduals:
                     plot_n_simulations,
                     plot_random_seed,
                     reference_phi_bin_index,
+                    reference_energy_bin_index,
                 )
 
         if show_gaussian_reference is None:
@@ -205,10 +251,27 @@ class PlottingResiduals:
                 show_gaussian,
             )
 
+        energy_coordinate_ids = {
+            "Em_Phi_projection",
+            "Em_Chi_projection",
+            "Em_Psi_projection",
+        }
+        if projection_id in energy_coordinate_ids:
+            if running_mean_window is not None:
+                raise ValueError("The running mean is only available for 1D plots.")
+            return self._plot_energy_coordinate_projection(
+                projection_id,
+                residual_type,
+                plot_n_simulations,
+                plot_random_seed,
+                show_gaussian,
+            )
+
         # Route HEALPix projections to their shared plotter.
         healpix_ids = {
             "PsiChi_projection",
             "Phi_PsiChi_projection",
+            "Em_PsiChi_projection",
         }
         if projection_id in healpix_ids:
             if running_mean_window is not None:
@@ -217,6 +280,7 @@ class PlottingResiduals:
                 projection_id,
                 residual_type,
                 phi_bin_index,
+                energy_bin_index,
                 plot_n_simulations,
                 plot_random_seed,
                 show_gaussian,
@@ -351,8 +415,15 @@ class PlottingResiduals:
             label="Fitted expectation",
         )
         counts_axis.set_ylabel("Counts")
+        energy_suffix = (
+            self._format_energy_interval_suffix()
+            if projection_id
+            in {"Phi_projection", "Chi_projection", "Psi_projection"}
+            else ""
+        )
         counts_axis.set_title(
             f"{residual_type.capitalize()} residual as a function of {axis_name}"
+            f"{energy_suffix}"
         )
         if residual_type in {"pearson", "fractional"}:
             # Put the summary in the large count panel, separate from its legend.
@@ -560,6 +631,194 @@ class PlottingResiduals:
 
         return "\n".join(statistics)
 
+    def _plot_energy_coordinate_projection(
+        self,
+        projection_id: str,
+        residual_type: str,
+        n_simulations: int | None = None,
+        random_seed: int | None = None,
+        show_gaussian_reference: bool = True,
+    ) -> Figure:
+        """Plot one rectangular residual view with energy on the vertical axis."""
+        coordinate_names = {
+            "Em_Phi_projection": "Phi",
+            "Em_Chi_projection": "Chi",
+            "Em_Psi_projection": "Psi",
+        }
+        if projection_id not in coordinate_names:
+            raise ValueError(f"Unknown energy-coordinate projection: {projection_id}")
+        if residual_type not in {"raw", "pearson", "fractional"}:
+            raise ValueError(f"Unknown residual type: {residual_type}")
+
+        coordinate_name = coordinate_names[projection_id]
+        projected_data = self.analysis.projected_data()
+        products = projected_data[projection_id]
+        residual_hist = self.analysis.residual_function(
+            projection_id,
+            residual_type,
+        )
+
+        energy_axis = products["observed"].axes["Em"]
+        coordinate_axis = products["observed"].axes[coordinate_name]
+        energy_unit = energy_axis.edges.unit
+        coordinate_unit = coordinate_axis.edges.unit
+        energy_edges = energy_axis.edges.to_value(energy_unit)
+        coordinate_edges = coordinate_axis.edges.to_value(coordinate_unit)
+        residual_values = np.asarray(residual_hist.contents, dtype=float)
+        finite_values = residual_values[np.isfinite(residual_values)]
+
+        if finite_values.size == 0:
+            raise ValueError(
+                f"No finite residual values are available for {projection_id}."
+            )
+
+        if residual_type == "fractional":
+            color_limit = np.quantile(np.abs(finite_values), 0.995)
+        else:
+            color_limit = np.max(np.abs(finite_values))
+        if color_limit == 0:
+            color_limit = 1.0
+
+        color_norm = TwoSlopeNorm(
+            vmin=-color_limit,
+            vcenter=0.0,
+            vmax=color_limit,
+        )
+
+        if residual_type == "raw":
+            figure, map_axis = plt.subplots(figsize=(9, 6))
+            distribution_axis = None
+        else:
+            figure, (map_axis, distribution_axis) = plt.subplots(
+                nrows=1,
+                ncols=2,
+                figsize=(13, 6),
+            )
+
+        image = map_axis.pcolormesh(
+            coordinate_edges,
+            energy_edges,
+            residual_values,
+            cmap="RdBu_r",
+            norm=color_norm,
+            shading="auto",
+        )
+        map_axis.set_xlabel(f"{coordinate_name} [{coordinate_unit}]")
+        map_axis.set_ylabel(f"Measured energy [{energy_unit}]")
+        map_axis.set_title(
+            f"{residual_type.capitalize()} residual: Em–{coordinate_name}"
+        )
+        if energy_axis.axis_scale == "log":
+            map_axis.set_yscale("log")
+
+        colorbar_label = f"{residual_type.capitalize()} residual"
+        if residual_type == "raw":
+            colorbar_label += " [counts]"
+        figure.colorbar(
+            image,
+            ax=map_axis,
+            label=colorbar_label,
+            extend="both" if residual_type == "fractional" else "neither",
+        )
+
+        if distribution_axis is not None:
+            reference = None
+            if residual_type == "pearson" and n_simulations is not None:
+                reference = self.analysis.pearson_poisson_reference(
+                    projection_id,
+                    n_simulations=n_simulations,
+                    bins=40,
+                    seed=random_seed,
+                )
+
+            if reference is None:
+                distribution_axis.hist(
+                    finite_values,
+                    bins=40,
+                    density=True,
+                    color="tab:blue",
+                    alpha=0.65,
+                    label=f"{residual_type.capitalize()} residuals",
+                )
+            else:
+                bin_edges = reference["bin_edges"]
+                bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+                distribution_axis.hist(
+                    finite_values,
+                    bins=bin_edges,
+                    density=True,
+                    color="tab:blue",
+                    alpha=0.55,
+                    label="Observed Pearson residuals",
+                )
+                distribution_axis.stairs(
+                    reference["density"],
+                    bin_edges,
+                    color="black",
+                    linewidth=1.5,
+                    label="Poisson MC mean density",
+                )
+                distribution_axis.fill_between(
+                    bin_centers,
+                    reference["lower"],
+                    reference["upper"],
+                    step="mid",
+                    color="tab:orange",
+                    alpha=0.25,
+                    label="95% pointwise MC interval",
+                )
+
+            if residual_type == "pearson" and show_gaussian_reference:
+                distribution_limit = max(
+                    4.0,
+                    1.1 * np.max(np.abs(finite_values)),
+                )
+                reference_x = np.linspace(
+                    -distribution_limit,
+                    distribution_limit,
+                    500,
+                )
+                distribution_axis.plot(
+                    reference_x,
+                    stats.norm.pdf(reference_x),
+                    color="black",
+                    linestyle="--",
+                    linewidth=1.5,
+                    label=r"Standard normal $N(0,1)$",
+                )
+
+            distribution_axis.axvline(
+                0.0,
+                color="black",
+                linestyle=":",
+                linewidth=1,
+            )
+            distribution_axis.text(
+                0.03,
+                0.95,
+                self._format_residual_statistics(
+                    finite_values,
+                    residual_type,
+                ),
+                transform=distribution_axis.transAxes,
+                verticalalignment="top",
+                bbox={
+                    "boxstyle": "round",
+                    "facecolor": "white",
+                    "alpha": 0.85,
+                },
+            )
+            distribution_axis.set_xlabel(
+                f"{residual_type.capitalize()} residual"
+            )
+            distribution_axis.set_ylabel("Probability density")
+            distribution_axis.legend(loc="upper right")
+            distribution_axis.grid(alpha=0.2)
+
+        figure.tight_layout()
+        plt.show()
+        return figure
+
     #---------------------------------------------------------------------------
     # Helper for plotting 2D
     #---------------------------------------------------------------------------
@@ -713,6 +972,7 @@ class PlottingResiduals:
             map_axis.set_ylabel(r"$\Phi$ [deg]")
             map_axis.set_title(
                 f"{residual_type.capitalize()} residual: {view['view_name']}"
+                f"{self._format_energy_interval_suffix()}"
             )
 
         # Add a distribution and summary statistics for normalized residuals.
@@ -837,21 +1097,25 @@ class PlottingResiduals:
         projection_id: str,
         residual_type: str,
         phi_bin_index: int | None = None,
+        energy_bin_index: int | None = None,
         n_simulations: int | None = None,
         random_seed: int | None = None,
         show_gaussian_reference: bool = True,
     ) -> Figure:
-        """Plot a PsiChi residual map, optionally for one Phi bin.
+        """Plot a PsiChi residual map, optionally for one Phi or Em bin.
 
         Args:
             projection_id: Either ``"PsiChi_projection"`` for the view
                 integrated over Phi, or ``"Phi_PsiChi_projection"`` for a
-                selected Phi slice.
+                selected Phi slice, or ``"Em_PsiChi_projection"`` for a
+                selected Em slice.
             residual_type: Residual definition: ``"raw"``, ``"pearson"``, or
                 ``"fractional"``.
             phi_bin_index: Phi-bin index required for
                 ``"Phi_PsiChi_projection"``; leave as ``None`` for the
                 Phi-integrated projection.
+            energy_bin_index: Em-bin index required for
+                ``"Em_PsiChi_projection"``.
             n_simulations: Optional number of fixed-fit Poisson realizations.
             random_seed: Optional seed for reproducible simulations.
             show_gaussian_reference: Whether to overlay a Gaussian reference.
@@ -861,8 +1125,9 @@ class PlottingResiduals:
 
         Raises:
             ValueError: If the residual type or projection is unsupported, or
-                if the Phi index is missing or not applicable.
-            IndexError: If ``phi_bin_index`` is outside the available bins.
+                if a required slice index is missing or not applicable.
+            IndexError: If a Phi or Em slice index is outside the available
+                bins.
         """
         if residual_type not in {"raw", "pearson", "fractional"}:
             raise ValueError(f"Unknown residual type: {residual_type}")
@@ -870,6 +1135,7 @@ class PlottingResiduals:
         if projection_id not in {
             "PsiChi_projection",
             "Phi_PsiChi_projection",
+            "Em_PsiChi_projection",
         }:
             raise ValueError(f"Unknown HEALPix projection: {projection_id}")
 
@@ -882,6 +1148,10 @@ class PlottingResiduals:
         # Get the HEALPix axis and select a Phi slice only when requested.
         psichi_axis = residual_hist.axes["PsiChi"]
         if projection_id == "Phi_PsiChi_projection":
+            if energy_bin_index is not None:
+                raise ValueError(
+                    "energy_bin_index applies only to Em_PsiChi_projection."
+                )
             if phi_bin_index is None:
                 raise ValueError(
                     "Provide phi_bin_index to select a Phi slice."
@@ -899,10 +1169,39 @@ class PlottingResiduals:
                 dtype=float,
             )
             view_label = f"at Phi = {phi_centers[phi_bin_index]:.1f} deg"
+        elif projection_id == "Em_PsiChi_projection":
+            if phi_bin_index is not None:
+                raise ValueError(
+                    "phi_bin_index applies only to Phi_PsiChi_projection."
+                )
+            if energy_bin_index is None:
+                raise ValueError(
+                    "Provide energy_bin_index to select an Em slice."
+                )
+
+            energy_axis = residual_hist.axes["Em"]
+            energy_edges = energy_axis.edges.to_value(u.keV)
+            if not 0 <= energy_bin_index < energy_axis.nbins:
+                raise IndexError(
+                    "energy_bin_index is outside the available Em bins."
+                )
+
+            map_values = np.asarray(
+                residual_hist.contents[energy_bin_index],
+                dtype=float,
+            )
+            view_label = (
+                f"for {energy_edges[energy_bin_index]:g}–"
+                f"{energy_edges[energy_bin_index + 1]:g} keV"
+            )
         else:
             if phi_bin_index is not None:
                 raise ValueError(
                     "phi_bin_index applies only to Phi_PsiChi_projection."
+                )
+            if energy_bin_index is not None:
+                raise ValueError(
+                    "energy_bin_index applies only to Em_PsiChi_projection."
                 )
 
             map_values = np.asarray(residual_hist.contents, dtype=float)
@@ -922,6 +1221,7 @@ class PlottingResiduals:
                 bins=40,
                 seed=random_seed,
                 phi_bin_index=phi_bin_index,
+                energy_bin_index=energy_bin_index,
             )
 
         # Center the map color scale on zero.
@@ -959,9 +1259,15 @@ class PlottingResiduals:
             norm=color_norm,
             cbar=False,
         )
+        energy_suffix = (
+            self._format_energy_interval_suffix()
+            if projection_id
+            in {"PsiChi_projection", "Phi_PsiChi_projection"}
+            else ""
+        )
         map_axis.set_title(
             f"{residual_type.capitalize()} residual on PsiChi "
-            f"{view_label}"
+            f"{view_label}{energy_suffix}"
         )
 
         colorbar_label = (
