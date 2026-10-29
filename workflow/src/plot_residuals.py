@@ -6,6 +6,7 @@ from matplotlib.figure import Figure
 from matplotlib.colors import TwoSlopeNorm
 from scipy import stats
 import astropy.units as u
+from astropy.time import Time
 from histpy import Histogram
 import mhealpy as mhp
 
@@ -45,8 +46,10 @@ class PlottingResiduals:
         Args:
             analysis: A ``ResidualAnalysis`` instance containing the observed
                 and expected histograms.
-            n_simulations: Optional number of Poisson realizations used for
-                Pearson reference histograms. ``None`` keeps simulations off.
+            n_simulations: Optional number of Monte Carlo realizations used
+                for Pearson reference histograms. ``None`` keeps simulations
+                off. Ordinary analyses use Poisson counts; temporal analyses
+                use multinomial counts.
             random_seed: Optional seed shared by the simulated references.
             phi_bin_index: Optional Phi slice prepared with the other
                 references and used by ``Phi_PsiChi_projection`` by default.
@@ -70,8 +73,57 @@ class PlottingResiduals:
         energy_edges = observed_hist.axes["Em"].edges.to_value(u.keV)
         return f" — {energy_edges[0]:g}–{energy_edges[-1]:g} keV"
 
+    def _format_time_interval_suffix(self) -> str:
+        """Format the selected time-bin boundaries for plot titles."""
+        time_bin_index = getattr(self.analysis, "time_bin_index", None)
+        time_start = getattr(self.analysis, "time_start", None)
+        time_stop = getattr(self.analysis, "time_stop", None)
+
+        if (
+            time_bin_index is None
+            or time_start is None
+            or time_stop is None
+        ):
+            return ""
+
+        start_time = Time(
+            time_start.to_value(u.s),
+            format="unix",
+            scale="utc",
+        )
+        stop_time = Time(
+            time_stop.to_value(u.s),
+            format="unix",
+            scale="utc",
+        )
+        start_label = start_time.strftime("%Y-%m-%d %H:%M:%S")
+        stop_label = stop_time.strftime("%Y-%m-%d %H:%M:%S")
+
+        return (
+            f"\nTime bin {time_bin_index}: "
+            f"{start_label}–{stop_label} UTC"
+        )
+
+    def _count_legend_labels(self) -> tuple[str, str]:
+        """Return count-plot labels for integrated or temporal analyses."""
+        if getattr(self.analysis, "time_bin_index", None) is None:
+            return "Observed", "Fitted expectation"
+
+        return (
+            r"Observed $D_{t,i}$",
+            r"Normalized model $\widetilde{M}_{t,i}$",
+        )
+
+    def _monte_carlo_mean_label(self) -> str:
+        """Describe the reference distribution used by the analysis."""
+        if getattr(self.analysis, "_temporal_total_counts", None) is not None:
+            return "Multinomial MC mean density"
+
+        return "Poisson MC mean density"
+
     def _prepare_pearson_references(
         self,
+        projection_id: str,
         n_simulations: int,
         random_seed: int,
         phi_bin_index: int | None,
@@ -79,6 +131,7 @@ class PlottingResiduals:
     ) -> None:
         """Prepare and cache the supported Pearson references once per setup."""
         configuration = (
+            projection_id,
             n_simulations,
             random_seed,
             phi_bin_index,
@@ -88,19 +141,27 @@ class PlottingResiduals:
             return
 
         available_projections = self.analysis.projected_data()
+        displayed_projections = (
+            ("Phi_Chi_projection", "Phi_Psi_projection")
+            if projection_id in {"Phi_Chi_projection", "Phi_Psi_projection"}
+            else (projection_id,)
+        )
         projection_bins = {
-            projection_id: bins
-            for projection_id, bins in self._PEARSON_REFERENCE_BINS.items()
-            if projection_id in available_projections
+            displayed_id: self._PEARSON_REFERENCE_BINS[displayed_id]
+            for displayed_id in displayed_projections
+            if displayed_id in available_projections
+            and displayed_id in self._PEARSON_REFERENCE_BINS
             and (
-                projection_id != "Phi_PsiChi_projection"
+                displayed_id != "Phi_PsiChi_projection"
                 or phi_bin_index is not None
             )
             and (
-                projection_id != "Em_PsiChi_projection"
+                displayed_id != "Em_PsiChi_projection"
                 or energy_bin_index is not None
             )
         }
+        if not projection_bins:
+            return
         phi_bin_indices = (
             {"Phi_PsiChi_projection": phi_bin_index}
             if "Phi_PsiChi_projection" in projection_bins
@@ -151,10 +212,10 @@ class PlottingResiduals:
             running_mean_window: Optional centered window size in bins for a
                 Pearson residual running mean. Windows are truncated at the
                 first and last bins; they do not wrap around the coordinate.
-            n_simulations: Number of fixed-fit Poisson realizations for the
-                Pearson residual distribution. If omitted, the constructor
+            n_simulations: Number of fixed-fit Monte Carlo realizations for
+                the Pearson residual distribution. If omitted, the constructor
                 setting is used; ``None`` keeps simulations off.
-            random_seed: Optional seed for reproducible Poisson realizations.
+            random_seed: Optional seed for reproducible reference realizations.
                 If omitted, the constructor setting is used. When simulations
                 are enabled without a seed, one seed is generated and reused.
             show_gaussian_reference: Whether to overlay the theoretical
@@ -189,7 +250,7 @@ class PlottingResiduals:
 
         if n_simulations is not None and residual_type != "pearson":
             raise ValueError(
-                "Poisson simulations are only available for Pearson residuals."
+                "Monte Carlo simulations are only available for Pearson residuals."
             )
         if show_gaussian_reference is not None and residual_type != "pearson":
             raise ValueError(
@@ -222,6 +283,7 @@ class PlottingResiduals:
                         )
                     plot_random_seed = self._generated_seed
                 self._prepare_pearson_references(
+                    projection_id,
                     plot_n_simulations,
                     plot_random_seed,
                     reference_phi_bin_index,
@@ -361,6 +423,7 @@ class PlottingResiduals:
         observed_values = observed_hist.contents
         expected_values = expected_hist.contents
         residual_values = residual_hist.contents
+        observed_label, expected_label = self._count_legend_labels()
 
         if residual_type == "raw":
             figure, axes = plt.subplots(
@@ -392,19 +455,35 @@ class PlottingResiduals:
             bin_edges,
             color="black",
             linewidth=1.5,
-            label="Observed",
+            label=observed_label,
         )
-        # Show the nominal one-sigma Poisson uncertainty around the prediction.
-        poisson_sigma = np.sqrt(expected_values)
-        # Draw the Poisson band using the true histogram boundaries.
+        # Show the nominal one-sigma uncertainty around the prediction.
+        temporal_total = getattr(
+            self.analysis,
+            "_temporal_total_counts",
+            None,
+        )
+        if temporal_total is None:
+            count_sigma = np.sqrt(expected_values)
+            uncertainty_label = r"Poisson uncertainty ($\pm 1\sigma$)"
+        else:
+            projected_probabilities = expected_values / temporal_total
+            count_sigma = np.sqrt(
+                temporal_total
+                * projected_probabilities
+                * np.clip(1.0 - projected_probabilities, 0.0, None)
+            )
+            uncertainty_label = r"Multinomial uncertainty ($\pm 1\sigma$)"
+
+        # Draw the uncertainty band using the true histogram boundaries.
         counts_axis.stairs(
-            expected_values + poisson_sigma,
+            expected_values + count_sigma,
             bin_edges,
-            baseline=expected_values - poisson_sigma,
+            baseline=expected_values - count_sigma,
             fill=True,
             color="tab:orange",
             alpha=0.3,
-            label=r"Poisson uncertainty ($\pm 1\sigma$)",
+            label=uncertainty_label,
         )
         counts_axis.stairs(
             expected_values,
@@ -412,7 +491,7 @@ class PlottingResiduals:
             color="red",
             linewidth=1.5,
             linestyle=":",
-            label="Fitted expectation",
+            label=expected_label,
         )
         counts_axis.set_ylabel("Counts")
         energy_suffix = (
@@ -424,6 +503,7 @@ class PlottingResiduals:
         counts_axis.set_title(
             f"{residual_type.capitalize()} residual as a function of {axis_name}"
             f"{energy_suffix}"
+            f"{self._format_time_interval_suffix()}"
         )
         if residual_type in {"pearson", "fractional"}:
             # Put the summary in the large count panel, separate from its legend.
@@ -458,6 +538,8 @@ class PlottingResiduals:
 
         residual_axis.set_xlabel(f"{axis_name} [{axis_unit}]")
         residual_axis.set_ylabel(f"{residual_type.capitalize()} residual")
+        if residual_type == "pearson":
+            residual_axis.set_ylim(-5.0, 5.0)
         residual_axis.grid(alpha=0.2)
 
         if running_mean_window is not None:
@@ -516,7 +598,7 @@ class PlottingResiduals:
                     bin_edges,
                     color="black",
                     linewidth=1.5,
-                    label="Poisson MC mean density",
+                    label=self._monte_carlo_mean_label(),
                 )
                 distribution_axis.fill_between(
                     bin_centers,
@@ -543,29 +625,34 @@ class PlottingResiduals:
                 linewidth=1,
             )
 
-            if residual_type == "pearson" and show_gaussian_reference:
-                # Mark the commonly used range of two standard deviations.
-                # residual_axis.axhspan(-2.0, 2.0, color="gray", alpha=0.15)
-                # residual_axis.set_ylim(-5.0, 5.0)
+            if residual_type == "pearson":
+                # Highlight the nominal three-sigma Pearson residual range.
+                residual_axis.axhspan(
+                    -3.0,
+                    3.0,
+                    color="limegreen",
+                    alpha=0.15,
+                    label=r"$\pm3\sigma$ range",
+                    zorder=0,
+                )
 
-                # Show Pearson residual reference levels in nominal sigma units.
-                for level, color, linestyle in (
-                    (1.0, "gray", ":"),
-                    (2.0, "black", "--"),
-                    (3.0, "gray", "-."),
+                # Mark the one- and two-sigma levels above the shared band.
+                for level, linestyle in (
+                    (1.0, ":"),
+                    (2.0, "--"),
                 ):
                     residual_axis.axhline(
                         level,
-                        color=color,
+                        color="limegreen",
                         linestyle=linestyle,
-                        linewidth=0.9,
+                        linewidth=1.2,
                         label=rf"$\pm{level:.0f}\sigma$",
                     )
                     residual_axis.axhline(
                         -level,
-                        color=color,
+                        color="limegreen",
                         linestyle=linestyle,
-                        linewidth=0.9,
+                        linewidth=1.2,
                     )
                 residual_axis.legend(
                     loc="upper right",
@@ -573,6 +660,7 @@ class PlottingResiduals:
                     fontsize="small",
                 )
 
+            if residual_type == "pearson" and show_gaussian_reference:
                 # Compare Pearson residuals with the standard normal density.
                 distribution_limit = max(
                     4.0,
@@ -707,6 +795,7 @@ class PlottingResiduals:
         map_axis.set_ylabel(f"Measured energy [{energy_unit}]")
         map_axis.set_title(
             f"{residual_type.capitalize()} residual: Em–{coordinate_name}"
+            f"{self._format_time_interval_suffix()}"
         )
         if energy_axis.axis_scale == "log":
             map_axis.set_yscale("log")
@@ -756,7 +845,7 @@ class PlottingResiduals:
                     bin_edges,
                     color="black",
                     linewidth=1.5,
-                    label="Poisson MC mean density",
+                    label=self._monte_carlo_mean_label(),
                 )
                 distribution_axis.fill_between(
                     bin_centers,
@@ -835,7 +924,7 @@ class PlottingResiduals:
         Args:
             residual_type: Residual definition: ``"raw"``, ``"pearson"``, or
                 ``"fractional"``.
-            n_simulations: Optional number of fixed-fit Poisson realizations.
+            n_simulations: Optional number of fixed-fit reference realizations.
             random_seed: Optional seed for reproducible simulations.
             show_gaussian_reference: Whether to overlay a Gaussian reference.
 
@@ -973,6 +1062,7 @@ class PlottingResiduals:
             map_axis.set_title(
                 f"{residual_type.capitalize()} residual: {view['view_name']}"
                 f"{self._format_energy_interval_suffix()}"
+                f"{self._format_time_interval_suffix()}"
             )
 
         # Add a distribution and summary statistics for normalized residuals.
@@ -1000,7 +1090,7 @@ class PlottingResiduals:
                         bin_edges,
                         color="black",
                         linewidth=1.5,
-                        label="Poisson MC mean density",
+                        label=self._monte_carlo_mean_label(),
                     )
                     distribution_axis.fill_between(
                         bin_centers,
@@ -1116,7 +1206,7 @@ class PlottingResiduals:
                 Phi-integrated projection.
             energy_bin_index: Em-bin index required for
                 ``"Em_PsiChi_projection"``.
-            n_simulations: Optional number of fixed-fit Poisson realizations.
+            n_simulations: Optional number of fixed-fit reference realizations.
             random_seed: Optional seed for reproducible simulations.
             show_gaussian_reference: Whether to overlay a Gaussian reference.
 
@@ -1268,6 +1358,7 @@ class PlottingResiduals:
         map_axis.set_title(
             f"{residual_type.capitalize()} residual on PsiChi "
             f"{view_label}{energy_suffix}"
+            f"{self._format_time_interval_suffix()}"
         )
 
         colorbar_label = (
@@ -1300,7 +1391,7 @@ class PlottingResiduals:
                 bin_edges,
                 color="black",
                 linewidth=1.5,
-                label="Poisson MC mean density",
+                label=self._monte_carlo_mean_label(),
             )
             distribution_axis.fill_between(
                 bin_centers,
