@@ -505,20 +505,6 @@ class PlottingResiduals:
             f"{energy_suffix}"
             f"{self._format_time_interval_suffix()}"
         )
-        if residual_type in {"pearson", "fractional"}:
-            # Put the summary in the large count panel, separate from its legend.
-            statistics_text = self._format_residual_statistics(
-                residual_values,
-                residual_type,
-            )
-            counts_axis.text(
-                0.02,
-                0.97,
-                statistics_text,
-                transform=counts_axis.transAxes,
-                verticalalignment="top",
-                bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.85},
-            )
         counts_axis.legend(loc="upper right")
         counts_axis.grid(alpha=0.2)
 
@@ -682,7 +668,7 @@ class PlottingResiduals:
 
             distribution_axis.set_xlabel(f"{residual_type.capitalize()} residual")
             distribution_axis.set_ylabel("Probability density")
-            distribution_axis.legend(loc="upper right")
+            distribution_axis.legend(loc="best")
             distribution_axis.grid(alpha=0.2)
 
         figure.tight_layout()
@@ -882,26 +868,11 @@ class PlottingResiduals:
                 linestyle=":",
                 linewidth=1,
             )
-            distribution_axis.text(
-                0.03,
-                0.95,
-                self._format_residual_statistics(
-                    finite_values,
-                    residual_type,
-                ),
-                transform=distribution_axis.transAxes,
-                verticalalignment="top",
-                bbox={
-                    "boxstyle": "round",
-                    "facecolor": "white",
-                    "alpha": 0.85,
-                },
-            )
             distribution_axis.set_xlabel(
                 f"{residual_type.capitalize()} residual"
             )
             distribution_axis.set_ylabel("Probability density")
-            distribution_axis.legend(loc="upper right")
+            distribution_axis.legend(loc="best")
             distribution_axis.grid(alpha=0.2)
 
         figure.tight_layout()
@@ -1136,22 +1107,6 @@ class PlottingResiduals:
                         label=r"Standard normal $N(0,1)$",
                     )
 
-                statistics_text = self._format_residual_statistics(
-                    finite_values,
-                    residual_type,
-                )
-                distribution_axis.text(
-                    0.03,
-                    0.95,
-                    statistics_text,
-                    transform=distribution_axis.transAxes,
-                    verticalalignment="top",
-                    bbox={
-                        "boxstyle": "round",
-                        "facecolor": "white",
-                        "alpha": 0.85,
-                    },
-                )
                 distribution_axis.set_title(
                     f"Residual distribution: {view['view_name']}"
                 )
@@ -1159,7 +1114,7 @@ class PlottingResiduals:
                     f"{residual_type.capitalize()} residual"
                 )
                 distribution_axis.set_ylabel("Probability density")
-                distribution_axis.legend(loc="upper right")
+                distribution_axis.legend(loc="best")
                 distribution_axis.grid(alpha=0.2)
 
         # Add one colorbar shared by both maps in its reserved axis.
@@ -1438,29 +1393,12 @@ class PlottingResiduals:
                 label=r"Standard normal $N(0,1)$",
             )
 
-        # Show descriptive statistics for the finite residuals.
-        statistics_text = self._format_residual_statistics(
-            finite_values,
-            residual_type,
-        )
-        distribution_axis.text(
-            0.03,
-            0.95,
-            statistics_text,
-            transform=distribution_axis.transAxes,
-            verticalalignment="top",
-            bbox={
-                "boxstyle": "round",
-                "facecolor": "white",
-                "alpha": 0.85,
-            },
-        )
         distribution_axis.set_title(
             f"Residual distribution {view_label}"
         )
         distribution_axis.set_xlabel(f"{residual_type.capitalize()} residual")
         distribution_axis.set_ylabel("Probability density")
-        distribution_axis.legend(loc="upper right")
+        distribution_axis.legend(loc="best")
         distribution_axis.grid(alpha=0.2)
 
         figure.tight_layout()
