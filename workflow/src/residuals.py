@@ -2,7 +2,9 @@ import numpy as np
 import pandas as pd
 from histpy import Axis, Histogram
 import astropy.units as u
-
+from .time_resolved_residuals_v1 import TimeResolvedResidualAnalysis
+from collections.abc import Sequence
+from pathlib import Path
 
 class ResidualAnalysis:
     def __init__(
@@ -10,6 +12,10 @@ class ResidualAnalysis:
         observed: Histogram,
         expected: Histogram,
         expected_floor: float | None = None,
+        time_residual: bool = False,
+        time_binned_observed: (
+            Histogram | str | Path | Sequence[str | Path] | None
+        ) = None,
     ) -> None:
         """Initialize the analysis with observed and expected histograms.
 
@@ -19,7 +25,37 @@ class ResidualAnalysis:
             expected_floor: Optional artificial floor used when preparing the
                 expected histogram. Bins at or below this value are excluded
                 only when they contain no observed counts.
+            time_residual: Whether to prepare a time-resolved residual analysis.
+            time_binned_observed: Time-binned observed histogram or paths to
+                the existing weekly time-binned histograms. Required when
+                time_residual is True.
         """
+        # Validate the optional time-resolved configuration.
+        if not isinstance(time_residual, bool):
+            raise TypeError("time_residual must be a boolean.")
+
+        self._temporal_total_counts = None
+        self._temporal_reference_probabilities = None
+        self._time_analysis = None
+        self.time_bin_index = None
+        self.time_start = None
+        self.time_stop = None
+
+        if time_residual:
+            if time_binned_observed is None:
+                raise ValueError(
+                    "time_binned_observed is required when "
+                    "time_residual=True."
+                )
+
+            self._time_analysis = TimeResolvedResidualAnalysis(
+                integrated_observed=observed,
+                integrated_expected=expected,
+                time_binned_observed=time_binned_observed,
+            )
+            expected = self._time_analysis.build_expected()
+            observed = self._time_analysis.observed_hist
+
         self.observed_hist = observed
         self.expected_hist = expected
         self.expected_floor = expected_floor
@@ -83,6 +119,100 @@ class ResidualAnalysis:
         # Initialize the projection cache.
         self._projected_data_cache = None
         self._poisson_reference_cache = {}
+
+    @classmethod
+    def from_temporal_bin(
+        cls,
+        observed: Histogram,
+        expected: Histogram,
+        integrated_expected: Histogram,
+        time_bin_index: int,
+        time_start,
+        time_stop,
+        expected_floor: float | None = None,
+    ) -> "ResidualAnalysis":
+        """Create an analysis from one prepared temporal interval.
+
+        Args:
+            observed: Observed CDS counts in the selected Time bin.
+            expected: Normalized expected CDS counts in the same Time bin.
+            integrated_expected: Integrated fitted model used to define the
+                multinomial CDS probabilities.
+            time_bin_index: Zero-based index of the selected Time bin.
+            time_start: Physical lower boundary of the selected Time bin.
+            time_stop: Physical upper boundary of the selected Time bin.
+            expected_floor: Optional artificial expected-count floor applied
+                by the selected residual analysis.
+
+        Returns:
+            A residual analysis configured with temporal plotting metadata and
+            multinomial reference probabilities.
+        """
+        if isinstance(time_bin_index, bool) or not isinstance(
+            time_bin_index,
+            (int, np.integer),
+        ):
+            raise TypeError("time_bin_index must be an integer.")
+        if time_bin_index < 0:
+            raise ValueError("time_bin_index must be non-negative.")
+
+        if integrated_expected.axes != observed.axes:
+            raise ValueError(
+                "Integrated expected and selected observed histograms must "
+                "have matching axes."
+            )
+        if integrated_expected.shape != observed.shape:
+            raise ValueError(
+                "Integrated expected and selected observed histograms must "
+                "have the same shape."
+            )
+
+        temporal_model = np.asarray(
+            integrated_expected.to_dense(copy=True).contents,
+            dtype=float,
+        )
+        if not np.all(np.isfinite(temporal_model)):
+            raise ValueError("Integrated expected contains non-finite values.")
+        if np.any(temporal_model < 0):
+            raise ValueError("Integrated expected contains negative values.")
+
+        temporal_model_total = float(temporal_model.sum())
+        if temporal_model_total <= 0:
+            raise ValueError("Integrated expected must have a positive total.")
+
+        analysis = cls(
+            observed=observed,
+            expected=expected,
+            expected_floor=expected_floor,
+        )
+        analysis.time_bin_index = int(time_bin_index)
+        analysis.time_start = time_start
+        analysis.time_stop = time_stop
+        analysis._temporal_total_counts = int(observed.contents.sum())
+        analysis._temporal_reference_probabilities = (
+            temporal_model / temporal_model_total
+        )
+        return analysis
+
+    def select_time_bin(self, time_bin_index: int) -> "ResidualAnalysis":
+        """Select one cached temporal interval for residual analysis.
+
+        Args:
+            time_bin_index: Zero-based index of the Time bin to select.
+
+        Returns:
+            A CDS-only residual analysis for the selected interval.
+        """
+        if self._time_analysis is None:
+            raise ValueError(
+                "select_time_bin is available only when "
+                "time_residual=True."
+            )
+
+        return self._time_analysis.select_time_bin(
+            time_bin_index,
+            expected_floor=self.expected_floor,
+        )
 
     def mask_function(self) -> tuple[np.ndarray, dict[str, object]]:
         """Build the valid-bin mask and summarize its effect."""
@@ -263,11 +393,30 @@ class ResidualAnalysis:
             contents=selected_expected_contents,
         )
 
-        return ResidualAnalysis(
+        selected_analysis = ResidualAnalysis(
             selected_observed,
             selected_expected,
             expected_floor=self.expected_floor,
         )
+
+        # Preserve the selected time interval in the energy-selected analysis.
+        selected_analysis.time_bin_index = self.time_bin_index
+        selected_analysis.time_start = self.time_start
+        selected_analysis.time_stop = self.time_stop
+
+        # Preserve the temporal multinomial reference without renormalizing
+        # the probability retained by the selected energy interval.
+        if self._temporal_reference_probabilities is not None:
+            selected_analysis._temporal_reference_probabilities = np.sum(
+                self._temporal_reference_probabilities[selection],
+                axis=energy_axis_index,
+                keepdims=True,
+            )
+            selected_analysis._temporal_total_counts = (
+                self._temporal_total_counts
+            )
+
+        return selected_analysis
 
     def split_psichi_function(
         self,
@@ -428,6 +577,12 @@ class ResidualAnalysis:
 
     def projected_data(self) -> dict[str, dict[str, Histogram]]:
         """Prepare the supported projected and split data products."""
+
+        if self._time_analysis is not None:
+            raise ValueError(
+                "Select a Time bin with select_time_bin(index) before "
+                "requesting residual projections."
+            )
 
         # Reuse the projections if they have already been built.
         if self._projected_data_cache is not None:
@@ -638,16 +793,19 @@ class ResidualAnalysis:
     ) -> dict[tuple[str, int | None], dict[str, np.ndarray | int]]:
         """Prepare references for several plots from shared CDS simulations.
 
-        Each full-CDS Poisson realization is generated once and then projected
-        to every requested view. Projected residual values are temporarily
-        retained to establish common histogram edges; full-CDS datasets are
-        not stored. The resulting summaries are cached for the plotting methods.
+        Each full-CDS reference realization is generated once and then
+        projected to every requested view. Ordinary analyses use independent
+        Poisson counts. Temporal shape analyses use multinomial counts with
+        the observed interval total fixed. Projected residual values are
+        temporarily retained to establish common histogram edges; full-CDS
+        datasets are not stored. The resulting summaries are cached for the
+        plotting methods.
 
         Args:
             projection_bins: Mapping from projection IDs to distribution
                 histogram bin counts. For example, use 15 for 1D views and 40
                 for 2D or HEALPix views.
-            n_simulations: Number of independent Poisson realizations.
+            n_simulations: Number of independent reference realizations.
             seed: Optional seed for reproducibility.
             phi_bin_indices: Optional Phi-bin index for each requested
                 ``"Phi_PsiChi_projection"`` slice.
@@ -678,6 +836,11 @@ class ResidualAnalysis:
         phi_bin_indices = phi_bin_indices or {}
         energy_bin_indices = energy_bin_indices or {}
         projected_data = self.projected_data()
+        reference_type = (
+            "multinomial"
+            if self._temporal_reference_probabilities is not None
+            else "poisson"
+        )
         effective_seed = (
             int(seed)
             if seed is not None
@@ -734,6 +897,7 @@ class ResidualAnalysis:
                 effective_seed,
                 phi_bin_index,
                 energy_bin_index,
+                reference_type,
             )
             reference_key = (projection_id, slice_index)
             if cache_key in self._poisson_reference_cache:
@@ -790,6 +954,44 @@ class ResidualAnalysis:
             dtype=float,
         )
 
+        multinomial_probabilities = None
+        if reference_type == "multinomial":
+            temporal_probabilities = np.asarray(
+                self._temporal_reference_probabilities,
+                dtype=float,
+            )
+            if temporal_probabilities.shape != self.expected_hist.shape:
+                raise ValueError(
+                    "Temporal reference probabilities do not match the "
+                    "analysis shape."
+                )
+            if (
+                not np.all(np.isfinite(temporal_probabilities))
+                or np.any(temporal_probabilities < 0)
+            ):
+                raise ValueError(
+                    "Temporal reference probabilities must be finite and "
+                    "non-negative."
+                )
+
+            flattened_probabilities = temporal_probabilities.reshape(-1).copy()
+            retained_probability = float(flattened_probabilities.sum())
+            if retained_probability > 1.0:
+                excess = retained_probability - 1.0
+                if excess > 1e-12:
+                    raise ValueError(
+                        "Temporal reference probabilities exceed one."
+                    )
+                largest_index = int(np.argmax(flattened_probabilities))
+                flattened_probabilities[largest_index] -= excess
+                retained_probability = 1.0
+
+            outside_probability = 1.0 - retained_probability
+            multinomial_probabilities = np.append(
+                flattened_probabilities,
+                outside_probability,
+            )
+
         def simulated_residuals(
             simulated_full: np.ndarray,
             request: dict[str, object],
@@ -818,7 +1020,16 @@ class ResidualAnalysis:
         # Generate each full-CDS realization once for every requested view.
         generator = np.random.default_rng(effective_seed)
         for _ in range(n_simulations):
-            simulated_full = generator.poisson(expected_full)
+            if reference_type == "multinomial":
+                simulated_with_outside = generator.multinomial(
+                    self._temporal_total_counts,
+                    multinomial_probabilities,
+                )
+                simulated_full = simulated_with_outside[:-1].reshape(
+                    self.expected_hist.shape
+                )
+            else:
+                simulated_full = generator.poisson(expected_full)
             for request in requests.values():
                 values = simulated_residuals(simulated_full, request)
                 request["samples"].append(values)
@@ -868,6 +1079,38 @@ class ResidualAnalysis:
             self._poisson_reference_cache[request["cache_key"]] = reference
 
         return references
+
+    def data_summary_table(self) -> pd.DataFrame:
+        """Describe the current observed/model histograms without projections.
+
+        Counts labeled 'all bins' include excluded bins; counts labeled
+        'valid bins' use the same analysis mask for observed and expected.
+        A selected-range analysis describes its already aggregated input.
+        """
+        rows = []
+        for axis in self.observed_hist.axes:
+            rows.append((f"{axis.label} bins", int(axis.nbins)))
+            if axis.label == "Em":
+                edges = axis.edges.to_value(u.keV)
+                rows.append(("Em edges [keV]", tuple(float(x) for x in edges)))
+            elif axis.label == "Phi":
+                edges = axis.edges.to_value(u.deg)
+                rows.append(("Phi range [deg]", (float(edges[0]), float(edges[-1]))))
+            elif axis.label == "PsiChi":
+                rows.append(("PsiChi HEALPix nside", int(axis.nside)))
+
+        # Report geometry and masking separately from the count totals.
+        valid_bins = int(np.count_nonzero(self.mask))
+        rows.extend([
+            ("Total bins", int(self.mask.size)),
+            ("Valid bins", valid_bins),
+            ("Excluded bins", int(self.mask.size) - valid_bins),
+            ("Observed counts (all bins)", float(self.observed_hist.contents.sum())),
+            ("Expected counts (all bins)", float(self.expected_hist.contents.sum())),
+            ("Observed counts (valid bins)", float(self.observed_hist.contents[self.mask].sum())),
+            ("Expected counts (valid bins)", float(self.expected_hist.contents[self.mask].sum())),
+        ])
+        return pd.DataFrame(rows, columns=["Statistic", "Value"])
 
     def statistics_table(self, residual_type: str) -> pd.DataFrame:
         """Summarize one residual type across valid full-CDS bins.

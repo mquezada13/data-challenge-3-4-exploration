@@ -25,7 +25,7 @@ repo_root = Path(__file__).resolve().parents[1]
 data_dir = repo_root / "data" / "inputs"
 data_dir_out = repo_root / "data" / "outputs"
 plot_dir_out = repo_root / "plot_outputs"
-config_dir = repo_root / "config"
+config_dir = repo_root / "data" / "config"
 
 
 # -----------------------------------------------------------------------------
