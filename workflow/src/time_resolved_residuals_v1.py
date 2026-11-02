@@ -4,8 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from pathlib import Path
+from typing import TYPE_CHECKING
 import numpy as np
 from histpy import Histogram
+
+if TYPE_CHECKING:
+    from .residuals import ResidualAnalysis
 
 
 class TimeResolvedResidualAnalysis:
@@ -121,6 +125,68 @@ class TimeResolvedResidualAnalysis:
         )
 
         return self.expected_hist
+
+    def select_time_bin(
+        self,
+        time_bin_index: int,
+        expected_floor: float | None = None,
+    ) -> "ResidualAnalysis":
+        """Select one temporal interval without rebuilding temporal products.
+
+        The complete ``D(t, i)`` and ``M_tilde(t, i)`` histograms are built
+        only when absent. Repeated selections therefore slice the cached
+        in-memory histograms instead of reopening the weekly inputs.
+
+        Args:
+            time_bin_index: Zero-based index of the Time bin to select.
+            expected_floor: Optional artificial expected-count floor applied
+                by the selected residual analysis.
+
+        Returns:
+            A residual analysis configured for the selected interval.
+        """
+        if isinstance(time_bin_index, bool) or not isinstance(
+            time_bin_index,
+            (int, np.integer),
+        ):
+            raise TypeError("time_bin_index must be an integer.")
+        if time_bin_index < 0:
+            raise ValueError("time_bin_index must be non-negative.")
+
+        if self.expected_hist is None:
+            self.build_expected()
+
+        number_of_time_bins = self.observed_hist.axes["Time"].nbins
+        if time_bin_index >= number_of_time_bins:
+            raise IndexError(
+                "time_bin_index is outside the available Time bins."
+            )
+
+        time_axis = self.observed_hist.axes["Time"]
+        selected_axes = list(self.observed_hist.axes)[1:]
+        selected_observed = Histogram(
+            selected_axes,
+            contents=self.observed_hist.contents[time_bin_index].copy(),
+            copy_contents=False,
+        )
+        selected_expected = Histogram(
+            selected_axes,
+            contents=self.expected_hist.contents[time_bin_index].copy(),
+            copy_contents=False,
+        )
+
+        # Import locally to avoid a module-level circular dependency.
+        from .residuals import ResidualAnalysis
+
+        return ResidualAnalysis.from_temporal_bin(
+            observed=selected_observed,
+            expected=selected_expected,
+            integrated_expected=self.integrated_expected_hist,
+            time_bin_index=time_bin_index,
+            time_start=time_axis.edges[time_bin_index],
+            time_stop=time_axis.edges[time_bin_index + 1],
+            expected_floor=expected_floor,
+        )
 
 
 

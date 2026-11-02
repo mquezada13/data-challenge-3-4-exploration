@@ -989,13 +989,19 @@ def test_time_residual_selects_and_normalizes_requested_interval():
         contents=np.array([3.0, 7.0]),
     )
 
-    analysis = ResidualAnalysis(
+    temporal_analysis = ResidualAnalysis(
         observed=integrated_observed,
         expected=integrated_expected,
         time_residual=True,
         time_binned_observed=time_binned_observed,
-        time_bin_index=1,
     )
+    analysis = temporal_analysis.select_time_bin(1)
+
+    assert tuple(temporal_analysis.observed_hist.axes.labels) == (
+        "Time",
+        "Phi",
+    )
+    assert temporal_analysis.time_bin_index is None
 
     np.testing.assert_array_equal(
         analysis.observed_hist.contents,
@@ -1011,8 +1017,111 @@ def test_time_residual_selects_and_normalizes_requested_interval():
     assert analysis.time_start == 10.0 * u.s
     assert analysis.time_stop == 20.0 * u.s
 
+
+def test_residual_analysis_selects_cached_time_intervals():
+    """Reuse complete temporal products through the public residual API."""
+    time_axis = Axis([0.0, 10.0, 20.0], label="Time", unit=u.s)
+    phi_axis = Axis([0.0, 1.0, 2.0], label="Phi", unit=u.deg)
+    time_binned_observed = Histogram(
+        [time_axis, phi_axis],
+        contents=np.array(
+            [
+                [2.0, 4.0],
+                [3.0, 1.0],
+            ]
+        ),
+    )
+    integrated_observed = Histogram(
+        [phi_axis],
+        contents=np.array([5.0, 5.0]),
+    )
+    integrated_expected = Histogram(
+        [phi_axis],
+        contents=np.array([3.0, 7.0]),
+    )
+    time_analysis = ResidualAnalysis(
+        observed=integrated_observed,
+        expected=integrated_expected,
+        time_residual=True,
+        time_binned_observed=time_binned_observed,
+    )
+
+    first_selection = time_analysis.select_time_bin(0)
+    observed_product = time_analysis._time_analysis.observed_hist
+    expected_product = time_analysis._time_analysis.expected_hist
+    second_selection = time_analysis.select_time_bin(1)
+
+    assert time_analysis._time_analysis.observed_hist is observed_product
+    assert time_analysis._time_analysis.expected_hist is expected_product
+    np.testing.assert_array_equal(
+        first_selection.observed_hist.contents,
+        [2.0, 4.0],
+    )
+    np.testing.assert_allclose(
+        first_selection.expected_hist.contents,
+        [1.8, 4.2],
+    )
+    np.testing.assert_array_equal(
+        second_selection.observed_hist.contents,
+        [3.0, 1.0],
+    )
+    np.testing.assert_allclose(
+        second_selection.expected_hist.contents,
+        [1.2, 2.8],
+    )
+    assert second_selection.time_bin_index == 1
+    assert second_selection.time_start == 10.0 * u.s
+    assert second_selection.time_stop == 20.0 * u.s
+    assert second_selection._temporal_total_counts == 4
+    np.testing.assert_allclose(
+        second_selection._temporal_reference_probabilities,
+        [0.3, 0.7],
+    )
+
+    second_selection._projected_data_cache = {
+        "Phi_projection": second_selection.projection_function("Phi")
+    }
+    figure = PlottingResiduals(second_selection).plot(
+        "Phi_projection",
+        residual_type="raw",
+    )
+    assert "Time bin 1" in figure.axes[0].get_title()
+    legend_labels = [
+        text.get_text()
+        for text in figure.axes[0].get_legend().get_texts()
+    ]
+    assert r"Multinomial uncertainty ($\pm 1\sigma$)" in legend_labels
+    plt.close(figure)
+
+
+def test_residual_analysis_rejects_invalid_time_selection_indices():
+    """Reject boolean, negative, and out-of-range Time-bin indices."""
+    time_axis = Axis([0.0, 10.0, 20.0], label="Time", unit=u.s)
+    phi_axis = Axis([0.0, 1.0, 2.0], label="Phi", unit=u.deg)
+    time_binned_observed = Histogram(
+        [time_axis, phi_axis],
+        contents=np.ones((2, 2)),
+    )
+    integrated = Histogram(
+        [phi_axis],
+        contents=np.array([2.0, 2.0]),
+    )
+    time_analysis = ResidualAnalysis(
+        observed=integrated,
+        expected=integrated.copy(),
+        time_residual=True,
+        time_binned_observed=time_binned_observed,
+    )
+
+    with pytest.raises(TypeError, match="must be an integer"):
+        time_analysis.select_time_bin(True)
+    with pytest.raises(ValueError, match="must be non-negative"):
+        time_analysis.select_time_bin(-1)
+    with pytest.raises(IndexError, match="outside the available Time bins"):
+        time_analysis.select_time_bin(2)
+
 def test_time_residual_requires_temporal_inputs():
-    """Require time-binned data and a valid integer Time-bin index."""
+    """Require time-binned data and explicit selection before projections."""
     histogram = make_histogram([2.0, 3.0])
 
     with pytest.raises(
@@ -1023,20 +1132,30 @@ def test_time_residual_requires_temporal_inputs():
             observed=histogram,
             expected=histogram.copy(),
             time_residual=True,
-            time_bin_index=0,
         )
 
     with pytest.raises(
-        TypeError,
-        match="time_bin_index must be an integer",
+        ValueError,
+        match="available only when time_residual=True",
     ):
         ResidualAnalysis(
             observed=histogram,
             expected=histogram.copy(),
-            time_residual=True,
-            time_binned_observed=histogram,
-            time_bin_index=True,
-        )
+        ).select_time_bin(0)
+
+    time_axis = Axis([0.0, 10.0], label="Time", unit=u.s)
+    time_binned_observed = Histogram(
+        [time_axis, histogram.axes[0]],
+        contents=np.array([[2.0, 3.0]]),
+    )
+    temporal_analysis = ResidualAnalysis(
+        observed=histogram,
+        expected=histogram.copy(),
+        time_residual=True,
+        time_binned_observed=time_binned_observed,
+    )
+    with pytest.raises(ValueError, match="Select a Time bin"):
+        temporal_analysis.residual_function("Phi_projection")
 
 
 def test_temporal_1d_plot_labels_model_and_utc_interval():
@@ -1141,13 +1260,13 @@ def test_temporal_reference_uses_fixed_total_multinomial_after_energy_selection(
         contents=np.array([[1.0, 2.0], [3.0, 4.0]]),
     )
 
-    temporal_analysis = ResidualAnalysis(
+    temporal_container = ResidualAnalysis(
         observed=integrated_observed,
         expected=integrated_expected,
         time_residual=True,
         time_binned_observed=time_binned_observed,
-        time_bin_index=1,
     )
+    temporal_analysis = temporal_container.select_time_bin(1)
     selected_analysis = temporal_analysis.select_energy_range(100.0, 200.0)
     selected_analysis._projected_data_cache = {
         "Phi_projection": selected_analysis.projection_function("Phi")
