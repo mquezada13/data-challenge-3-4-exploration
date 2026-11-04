@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
-from histpy import Histogram
+from histpy import Axis, Histogram
 
 
 class TimeResolvedResidualAnalysis:
@@ -28,6 +28,103 @@ class TimeResolvedResidualAnalysis:
 
         self.integrated_expected_hist = integrated_expected
         self.observed_hist = self._densify_observed_counts(observed)
+        self._physical_configuration = None
+        self._physical_cache = {}
+
+    def configure_physical_model(
+        self,
+        fitted_image: Histogram,
+        response_path,
+        orientation,
+        temporal_background: Histogram,
+        background_normalization: float,
+        *,
+        earth_occ: bool,
+        nside_scatt_map: int | None = None,
+    ) -> None:
+        """Set the inputs for physical predictions and clear cached bins.
+
+        Keep the supplied objects unchanged while using cached predictions.
+        Call this method again after changing any input or response setting.
+        The response file is opened only when new bins are calculated.
+        """
+        self._physical_configuration = {
+            "fitted_image": fitted_image,
+            "response_path": response_path,
+            "orientation": orientation,
+            "temporal_background": temporal_background,
+            "background_normalization": background_normalization,
+            "earth_occ": earth_occ,
+            "nside_scatt_map": nside_scatt_map,
+        }
+        self._physical_cache.clear()
+
+    def build_physical_time_range(
+        self, start: int = 0, stop: int | None = None, *, bins_per_group: int = 1
+    ) -> tuple[Histogram, Histogram]:
+        """Return observed and physical expected counts for consecutive bins.
+
+        ``start`` is inclusive and ``stop`` is exclusive. The default range
+        covers the complete Time axis. Already calculated bins are reused in
+        memory; their indices refer to the original observed histogram.
+        Returned histograms have matching Time and CDS axes and can be passed
+        directly to ResidualAnalysis. Their time-bin indices start at zero.
+        ``bins_per_group`` optionally combines that many consecutive original
+        bins, summing observed and expected counts before residuals are formed.
+        The selected range must contain a whole number of groups. Original
+        bins are calculated and cached individually even when grouped.
+        """
+        if self._physical_configuration is None:
+            raise ValueError("Configure the physical model before building a time range.")
+        n_bins = self.observed_hist.axes["Time"].nbins
+        if stop is None:
+            stop = n_bins
+        for name, value in (("start", start), ("stop", stop)):
+            if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+                raise TypeError(f"{name} must be an integer.")
+        if not 0 <= start < stop <= n_bins:
+            raise ValueError("The time range must contain available consecutive bins.")
+        if isinstance(bins_per_group, bool) or not isinstance(bins_per_group, (int, np.integer)):
+            raise TypeError("bins_per_group must be an integer.")
+        if bins_per_group < 1 or (stop - start) % bins_per_group:
+            raise ValueError("bins_per_group must be positive and divide the selected range exactly.")
+
+        missing = [index for index in range(start, stop) if index not in self._physical_cache]
+        if missing:
+            from cosipy.response import FullDetectorResponse
+
+            configuration = self._physical_configuration.copy()
+            response_path = configuration.pop("response_path")
+            with FullDetectorResponse.open(response_path) as detector_response:
+                for index in missing:
+                    products = self.build_physical_time_bin(
+                        time_bin_index=index,
+                        detector_response=detector_response,
+                        **configuration,
+                    )
+                    self._physical_cache[index] = products["total"].contents.copy()
+
+        time_axis = self.observed_hist.axes["Time"][start:stop]
+        observed_values = self.observed_hist.contents[start:stop].copy()
+        expected_values = np.stack([self._physical_cache[index] for index in range(start, stop)])
+        if bins_per_group > 1:
+            # Keep the original time boundaries and sum complete groups.
+            time_axis = Axis(
+                time_axis.edges[::bins_per_group], label="Time", unit=time_axis.unit
+            )
+            grouped_shape = ((stop - start) // bins_per_group, bins_per_group, *observed_values.shape[1:])
+            observed_values = observed_values.reshape(grouped_shape).sum(axis=1)
+            expected_values = expected_values.reshape(grouped_shape).sum(axis=1)
+        axes = [time_axis, *list(self.observed_hist.axes)[1:]]
+        observed = Histogram(
+            axes, contents=observed_values, copy_contents=False
+        )
+        expected = Histogram(
+            axes,
+            contents=expected_values,
+            copy_contents=False,
+        )
+        return observed, expected
 
     # ----------------------------------------------------------------------
     # Expected counts M(t,i)

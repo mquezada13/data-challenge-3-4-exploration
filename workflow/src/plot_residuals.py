@@ -2,6 +2,7 @@
 
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 from matplotlib.figure import Figure
 from matplotlib.colors import TwoSlopeNorm
 from scipy import stats
@@ -19,6 +20,7 @@ class PlottingResiduals:
     """
 
     _PEARSON_REFERENCE_BINS = {
+        "Time_projection": 15,
         "Em_projection": 15,
         "Em_Phi_projection": 40,
         "Em_Chi_projection": 40,
@@ -106,12 +108,14 @@ class PlottingResiduals:
 
     def _count_legend_labels(self) -> tuple[str, str]:
         """Return count-plot labels for integrated or temporal analyses."""
+        if getattr(self.analysis, "_time_analysis", None) is not None:
+            return r"Observed $D_t$", r"Physical model $M_t$"
         if getattr(self.analysis, "time_bin_index", None) is None:
             return "Observed", "Fitted expectation"
 
         return (
             r"Observed $D_{t,i}$",
-            r"Normalized model $\widetilde{M}_{t,i}$",
+            r"Physical model $M_{t,i}$",
         )
 
     def _monte_carlo_mean_label(self) -> str:
@@ -198,6 +202,7 @@ class PlottingResiduals:
         random_seed: int | None = None,
         show_gaussian_reference: bool | None = None,
         energy_bin_index: int | None = None,
+        show_uncertainty: bool | None = None,
     ) -> Figure:
         """Create a residual figure for a selected projection.
 
@@ -223,6 +228,9 @@ class PlottingResiduals:
                 simulations and hidden when simulations are requested.
             energy_bin_index: Em-bin index for a slice of
                 ``"Em_PsiChi_projection"``.
+            show_uncertainty: Show the existing nominal count uncertainty band.
+                By default it is hidden for physical temporal analyses and
+                retained for other analyses.
 
         Returns:
             The Matplotlib figure containing the requested diagnostic.
@@ -350,6 +358,7 @@ class PlottingResiduals:
 
         # Route supported one-dimensional projections to their plotter.
         one_dimensional_ids = {
+            "Time_projection",
             "Em_projection",
             "Phi_projection",
             "Chi_projection",
@@ -378,6 +387,7 @@ class PlottingResiduals:
             plot_n_simulations,
             plot_random_seed,
             show_gaussian,
+            show_uncertainty,
         )
 
     #---------------------------------------------------------------------------
@@ -394,6 +404,7 @@ class PlottingResiduals:
         n_simulations: int | None = None,
         random_seed: int | None = None,
         show_gaussian_reference: bool = True,
+        show_uncertainty: bool | None = None,
     ) -> Figure:
         """Plot observed and expected counts with one-dimensional residuals.
 
@@ -418,6 +429,14 @@ class PlottingResiduals:
         x_values = axis.centers.to_value(axis_unit)
         # Use the true bin boundaries for step plots.
         bin_edges = axis.edges.to_value(axis_unit)
+        if axis_name == "Time":
+            # Convert the actual Unix-time boundaries and centers to UTC dates.
+            bin_edges = mdates.date2num(
+                Time(axis.edges.to_value(u.s), format="unix", scale="utc").datetime
+            )
+            x_values = mdates.date2num(
+                Time(axis.centers.to_value(u.s), format="unix", scale="utc").datetime
+            )
 
         # Get the counts and residual values from the input histograms.
         observed_values = observed_hist.contents
@@ -463,6 +482,12 @@ class PlottingResiduals:
             "_temporal_total_counts",
             None,
         )
+        physical_temporal = (
+            getattr(self.analysis, "_time_analysis", None) is not None
+            or getattr(self.analysis, "time_bin_index", None) is not None
+        ) and temporal_total is None
+        if show_uncertainty is None:
+            show_uncertainty = not physical_temporal
         if temporal_total is None:
             count_sigma = np.sqrt(expected_values)
             uncertainty_label = r"Poisson uncertainty ($\pm 1\sigma$)"
@@ -476,15 +501,16 @@ class PlottingResiduals:
             uncertainty_label = r"Multinomial uncertainty ($\pm 1\sigma$)"
 
         # Draw the uncertainty band using the true histogram boundaries.
-        counts_axis.stairs(
-            expected_values + count_sigma,
-            bin_edges,
-            baseline=expected_values - count_sigma,
-            fill=True,
-            color="tab:orange",
-            alpha=0.3,
-            label=uncertainty_label,
-        )
+        if show_uncertainty:
+            counts_axis.stairs(
+                expected_values + count_sigma,
+                bin_edges,
+                baseline=expected_values - count_sigma,
+                fill=True,
+                color="tab:orange",
+                alpha=0.3,
+                label=uncertainty_label,
+            )
         counts_axis.stairs(
             expected_values,
             bin_edges,
@@ -522,7 +548,13 @@ class PlottingResiduals:
             linestyle="--",
         )
 
-        residual_axis.set_xlabel(f"{axis_name} [{axis_unit}]")
+        if axis_name == "Time":
+            locator = mdates.AutoDateLocator()
+            residual_axis.xaxis.set_major_locator(locator)
+            residual_axis.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+            residual_axis.set_xlabel("Time (UTC)")
+        else:
+            residual_axis.set_xlabel(f"{axis_name} [{axis_unit}]")
         residual_axis.set_ylabel(f"{residual_type.capitalize()} residual")
         if residual_type == "pearson":
             residual_axis.set_ylim(-5.0, 5.0)

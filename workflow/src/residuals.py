@@ -586,10 +586,11 @@ class ResidualAnalysis:
         """Prepare the supported projected and split data products."""
 
         if self._time_analysis is not None:
-            raise ValueError(
-                "Select a Time bin with select_time_bin(index) before "
-                "requesting residual projections."
-            )
+            if self._projected_data_cache is None:
+                self._projected_data_cache = {
+                    "Time_projection": self.projection_function("Time")
+                }
+            return self._projected_data_cache
 
         # Reuse the projections if they have already been built.
         if self._projected_data_cache is not None:
@@ -729,6 +730,7 @@ class ResidualAnalysis:
         )
 
         direct_axes = {
+            "Time_projection": ("Time",),
             "Em_projection": ("Em",),
             "Em_Phi_projection": ("Em", "Phi"),
             "Em_PsiChi_projection": ("Em", "PsiChi"),
