@@ -1,262 +1,138 @@
-"""Construct time-resolved observed counts from existing binned data."""
+"""Analyze time-resolved observed counts with an integrated model."""
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from pathlib import Path
-from typing import TYPE_CHECKING
 import numpy as np
 from histpy import Histogram
 
-if TYPE_CHECKING:
-    from .residuals import ResidualAnalysis
-
 
 class TimeResolvedResidualAnalysis:
-    """Construct D(t,i) from the original time-binned observations."""
+    """Prepare physical temporal predictions from observed D(t,i)."""
 
     # ----------------------------------------------------------------------
     # Input data and configuration
     # ----------------------------------------------------------------------
     def __init__(
         self,
-        integrated_observed: Histogram,
+        observed: Histogram,
         integrated_expected: Histogram,
-        time_binned_observed: Histogram | str | Path | Sequence[str | Path],
-        observed_time_histogram_name: str = "hist",
     ) -> None:
-        if integrated_expected.axes != integrated_observed.axes:
-            raise ValueError("Integrated D and M must have matching CDS axes.")
+        if "Time" not in observed.axes.labels:
+            raise ValueError("Temporal analysis requires observed D(t,i) with a Time axis.")
+        expected_labels = ("Time", *(str(label) for label in integrated_expected.axes.labels))
+        if tuple(str(label) for label in observed.axes.labels) != expected_labels:
+            raise ValueError("Observed D(t,i) must have Time first and match the integrated model axes.")
+        for label in integrated_expected.axes.labels:
+            if observed.axes[str(label)] != integrated_expected.axes[str(label)]:
+                raise ValueError(f"Observed D(t,i) and integrated M have incompatible {label} bins.")
 
-        self.integrated_observed_hist = integrated_observed
         self.integrated_expected_hist = integrated_expected
-
-        if isinstance(time_binned_observed, Histogram):
-            self.time_binned_observed = time_binned_observed
-        elif isinstance(time_binned_observed, (str, Path)):
-            self.time_binned_observed = (Path(time_binned_observed),)
-        else:
-            self.time_binned_observed = tuple(
-                Path(path) for path in time_binned_observed
-            )
-
-        self.observed_time_histogram_name = observed_time_histogram_name
-        self.observed_hist: Histogram | None = None
-        self.expected_hist: Histogram | None = None
+        self.observed_hist = self._densify_observed_counts(observed)
 
     # ----------------------------------------------------------------------
-    # Observed counts D(t,i)
+    # Expected counts M(t,i)
     # ----------------------------------------------------------------------
-    def build_observed(self) -> Histogram:
-        """Build observed counts using the original time-binned data."""
-        observed_histograms = self._load_observed_time_histograms()
-
-        self._validate_observed_time_axes(observed_histograms)
-        self._validate_observed_time_binning(observed_histograms)
-
-        combined = self._combine_observed_time_histograms(
-            observed_histograms
-        )
-
-        self._validate_observed_time_consistency(combined)
-        self.observed_hist = self._densify_observed_counts(combined)
-
-        return self.observed_hist
-
-    def build_expected(self) -> Histogram:
-        """Normalize the integrated model to the observed counts in each time bin."""
-        # Build D(t,i) first if it is not already available.
-        if self.observed_hist is None:
-            self.build_observed()
-
-        # Convert the integrated model to a dense floating-point array.
-        reference = self.integrated_expected_hist.to_dense(copy=True)
-        model_values = np.asarray(reference.contents, dtype=float)
-
-        # Validate the integrated model before normalizing it.
-        if not np.all(np.isfinite(model_values)):
-            raise ValueError("Integrated M contains non-finite values.")
-
-        if np.any(model_values < 0):
-            raise ValueError("Integrated M contains negative values.")
-
-        model_total = model_values.sum()
-
-        if model_total <= 0:
-            raise ValueError("Integrated M must have a positive total.")
-
-        # Sum D(t,i) over every CDS axis while preserving the Time axis.
-        cds_axes = tuple(range(1, self.observed_hist.ndim))
-        interval_totals = np.asarray(
-            self.observed_hist.contents.sum(axis=cds_axes),
-            dtype=float,
-        )
-
-        # Convert M(i) into the normalized CDS shape p(i).
-        normalized_model = model_values / model_total
-
-        # Reshape N(t) so it can multiply every CDS bin in each time interval.
-        interval_shape = (len(interval_totals),) + (1,) * reference.ndim
-
-        # Construct M_tilde(t,i) = N(t) M(i) / sum_j M(j).
-        expected_contents = (
-            interval_totals.reshape(interval_shape) * normalized_model
-        )
-
-        # Verify that each normalized model has the observed interval total.
-        reconstructed_interval_totals = expected_contents.sum(axis=cds_axes)
-
-        if not np.allclose(
-            reconstructed_interval_totals,
-            interval_totals,
-            rtol=1e-10,
-            atol=1e-10,
-        ):
-            raise ValueError(
-                "Normalized M does not reproduce the observed total "
-                "in every time bin."
-            )
-
-        # Store the complete M_tilde(t,i) histogram with the D(t,i) axes.
-        self.expected_hist = Histogram(
-            self.observed_hist.axes,
-            contents=expected_contents,
-            copy_contents=False,
-        )
-
-        return self.expected_hist
-
-    def select_time_bin(
+    def build_physical_time_bin(
         self,
         time_bin_index: int,
-        expected_floor: float | None = None,
-    ) -> "ResidualAnalysis":
-        """Select one temporal interval without rebuilding temporal products.
+        fitted_image: Histogram,
+        detector_response,
+        orientation,
+        temporal_background: Histogram,
+        background_normalization: float,
+        *,
+        earth_occ: bool,
+        nside_scatt_map: int | None = None,
+    ) -> dict[str, Histogram]:
+        """Forward-fold a fitted sky and temporal background for one bin.
 
-        The complete ``D(t, i)`` and ``M_tilde(t, i)`` histograms are built
-        only when absent. Repeated selections therefore slice the cached
-        in-memory histograms instead of reopening the weekly inputs.
-
-        Args:
-            time_bin_index: Zero-based index of the Time bin to select.
-            expected_floor: Optional artificial expected-count floor applied
-                by the selected residual analysis.
-
-        Returns:
-            A residual analysis configured for the selected interval.
+        The background must be a time-binned template matching the observed
+        histogram, and its normalization must come from the integrated fit.
+        The interval response is constructed from the supplied spacecraft
+        history. Results are provisional until the response configuration is
+        checked against the one used in the integrated fit.
         """
+        from astropy.time import Time
+        import astropy.units as u
+
         if isinstance(time_bin_index, bool) or not isinstance(
-            time_bin_index,
-            (int, np.integer),
+            time_bin_index, (int, np.integer)
         ):
             raise TypeError("time_bin_index must be an integer.")
-        if time_bin_index < 0:
-            raise ValueError("time_bin_index must be non-negative.")
+        if not 0 <= time_bin_index < self.observed_hist.axes["Time"].nbins:
+            raise IndexError("time_bin_index is outside the available Time bins.")
+        if temporal_background.axes != self.observed_hist.axes:
+            raise ValueError("Temporal background and observed data must have matching axes.")
+        if not np.isfinite(background_normalization) or background_normalization < 0:
+            raise ValueError("Background normalization must be finite and non-negative.")
+        if tuple(fitted_image.axes.labels) != ("lb", "Ei"):
+            raise ValueError("The fitted sky image must have axes (lb, Ei).")
 
-        if self.expected_hist is None:
-            self.build_expected()
+        # The histogram Time axis stores Unix seconds, matching the notebook.
+        edges = self.observed_hist.axes["Time"].edges
+        start = Time(edges[time_bin_index].to_value(u.s), format="unix")
+        stop = Time(edges[time_bin_index + 1].to_value(u.s), format="unix")
+        interval_orientation = orientation.select_interval(start, stop)
 
-        number_of_time_bins = self.observed_hist.axes["Time"].nbins
-        if time_bin_index >= number_of_time_bins:
-            raise IndexError(
-                "time_bin_index is outside the available Time bins."
+        # Fold one sky pixel at a time to avoid storing the full response matrix.
+        model_values = np.asarray(fitted_image.contents, dtype=float)
+        if not np.all(np.isfinite(model_values)) or np.any(model_values < 0):
+            raise ValueError("The fitted sky image contains invalid values.")
+        if fitted_image.axes["Ei"] != detector_response.axes["Ei"]:
+            raise ValueError("Fitted sky and detector response energy bins do not match.")
+        if fitted_image.unit is None:
+            raise ValueError("The fitted sky image must have physical units.")
+
+        source_values = np.zeros(self.integrated_expected_hist.shape, dtype=float)
+        source_axes = None
+        pixel_area = fitted_image.axes["lb"].pixarea()
+        for pixel_index, pixel_values in enumerate(model_values):
+            if not np.any(pixel_values):
+                continue
+            pixel_response = detector_response.get_point_source_response_per_image_pixel(
+                pixel_index,
+                interval_orientation,
+                coordsys="galactic",
+                nside_image=fitted_image.axes["lb"].nside,
+                nside_scatt_map=nside_scatt_map,
+                earth_occ=earth_occ,
             )
+            pixel_axes = pixel_response.axes
+            if pixel_axes["Ei"] != fitted_image.axes["Ei"]:
+                raise ValueError("Pixel response and fitted sky energy bins do not match.")
+            if pixel_axes[1:] != self.integrated_expected_hist.axes:
+                raise ValueError("Interval source response and fitted CDS axes do not match.")
+            conversion = (fitted_image.unit * pixel_response.unit * pixel_area).to_value(
+                u.dimensionless_unscaled
+            )
+            source_values += conversion * np.tensordot(
+                pixel_values, np.asarray(pixel_response.contents), axes=(0, 0)
+            )
+            source_axes = pixel_axes[1:]
 
-        time_axis = self.observed_hist.axes["Time"]
-        selected_axes = list(self.observed_hist.axes)[1:]
-        selected_observed = Histogram(
-            selected_axes,
-            contents=self.observed_hist.contents[time_bin_index].copy(),
+        if source_axes is None:
+            source_axes = self.integrated_expected_hist.axes
+        source = Histogram(source_axes, contents=source_values, copy_contents=False)
+        expected_axes = list(self.observed_hist.axes)[1:]
+
+        # Scale the actual simulated background in the same interval as the data.
+        background_values = temporal_background.contents[time_bin_index]
+        if hasattr(background_values, "todense"):
+            background_values = background_values.todense()
+        background_values = np.asarray(background_values, dtype=float)
+        if not np.all(np.isfinite(background_values)) or np.any(background_values < 0):
+            raise ValueError("Temporal background contains invalid counts.")
+        background = Histogram(
+            expected_axes,
+            contents=background_normalization * background_values,
             copy_contents=False,
         )
-        selected_expected = Histogram(
-            selected_axes,
-            contents=self.expected_hist.contents[time_bin_index].copy(),
+        total = Histogram(
+            expected_axes,
+            contents=np.asarray(source.contents) + background.contents,
             copy_contents=False,
         )
-
-        # Import locally to avoid a module-level circular dependency.
-        from .residuals import ResidualAnalysis
-
-        return ResidualAnalysis.from_temporal_bin(
-            observed=selected_observed,
-            expected=selected_expected,
-            integrated_expected=self.integrated_expected_hist,
-            time_bin_index=time_bin_index,
-            time_start=time_axis.edges[time_bin_index],
-            time_stop=time_axis.edges[time_bin_index + 1],
-            expected_floor=expected_floor,
-        )
-
-
-
-    def _load_observed_time_histograms(self) -> tuple[Histogram, ...]:
-        """Load all time-binned observed histograms."""
-        if isinstance(self.time_binned_observed, Histogram):
-            return (self.time_binned_observed,)
-
-        if not self.time_binned_observed:
-            raise ValueError("No time-binned observations supplied.")
-
-        return tuple(
-            Histogram.open(path, name=self.observed_time_histogram_name)
-            for path in self.time_binned_observed
-        )
-
-    def _validate_observed_time_axes(
-        self,
-        histograms: tuple[Histogram, ...],
-    ) -> None:
-        """Check that time and CDS axes are present and ordered correctly."""
-        expected_labels = (
-            "Time",
-            *(str(label) for label in self.integrated_observed_hist.axes.labels),
-        )
-
-        for index, histogram in enumerate(histograms):
-            labels = tuple(str(label) for label in histogram.axes.labels)
-            if labels != expected_labels:
-                raise ValueError(
-                    f"Observed histogram {index} has incompatible axis ordering."
-                )
-
-    def _validate_observed_time_binning(
-        self,
-        histograms: tuple[Histogram, ...],
-    ) -> None:
-        """Check compatible time and CDS binning."""
-        reference_time_axis = histograms[0].axes["Time"]
-
-        for index, histogram in enumerate(histograms):
-            if histogram.axes["Time"] != reference_time_axis:
-                raise ValueError(
-                    f"Observed histogram {index} has incompatible time bins."
-                )
-
-            for label in self.integrated_observed_hist.axes.labels:
-                if (
-                    histogram.axes[str(label)]
-                    != self.integrated_observed_hist.axes[str(label)]
-                ):
-                    raise ValueError(
-                        f"Observed histogram {index} has incompatible {label} bins."
-                    )
-
-    @staticmethod
-    def _combine_observed_time_histograms(
-        histograms: tuple[Histogram, ...],
-    ) -> Histogram:
-        """Combine observed counts across all input histograms."""
-        contents = histograms[0].contents.copy()
-
-        for histogram in histograms[1:]:
-            contents = contents + histogram.contents
-
-        return Histogram(
-            histograms[0].axes,
-            contents=contents,
-            copy_contents=False,
-        )
+        return {"source": source, "background": background, "total": total}
 
     @staticmethod
     def _densify_observed_counts(histogram: Histogram) -> Histogram:
@@ -292,20 +168,3 @@ class TimeResolvedResidualAnalysis:
                 ).to_dense(copy=False)
 
         return histogram.to_dense(copy=True)
-
-    def _validate_observed_time_consistency(
-        self,
-        observed: Histogram,
-    ) -> None:
-        """Verify that summing D(t,i) reproduces integrated D."""
-        labels = tuple(
-            str(label) for label in self.integrated_observed_hist.axes.labels
-        )
-
-        summed = observed.project(*labels).to_dense(copy=True)
-        reference = self.integrated_observed_hist.to_dense(copy=True)
-
-        if not np.array_equal(summed.contents, reference.contents):
-            raise ValueError(
-                "Time-resolved D does not reproduce integrated D."
-            )

@@ -3,8 +3,6 @@ import pandas as pd
 from histpy import Axis, Histogram
 import astropy.units as u
 from .time_resolved_residuals_v1 import TimeResolvedResidualAnalysis
-from collections.abc import Sequence
-from pathlib import Path
 
 class ResidualAnalysis:
     def __init__(
@@ -12,28 +10,21 @@ class ResidualAnalysis:
         observed: Histogram,
         expected: Histogram,
         expected_floor: float | None = None,
-        time_residual: bool = False,
-        time_binned_observed: (
-            Histogram | str | Path | Sequence[str | Path] | None
-        ) = None,
+        *,
+        _announce: bool = True,
     ) -> None:
         """Initialize the analysis with observed and expected histograms.
 
         Args:
             observed: Histogram containing observed counts.
-            expected: Histogram containing fitted expected counts.
+            expected: Fitted counts; temporal observations require a prepared
+                physical expectation with the same Time and CDS axes.
             expected_floor: Optional artificial floor used when preparing the
                 expected histogram. Bins at or below this value are excluded
                 only when they contain no observed counts.
-            time_residual: Whether to prepare a time-resolved residual analysis.
-            time_binned_observed: Time-binned observed histogram or paths to
-                the existing weekly time-binned histograms. Required when
-                time_residual is True.
+            A Time axis in observed selects time-resolved analysis; otherwise
+            the existing time-integrated analysis is used.
         """
-        # Validate the optional time-resolved configuration.
-        if not isinstance(time_residual, bool):
-            raise TypeError("time_residual must be a boolean.")
-
         self._temporal_total_counts = None
         self._temporal_reference_probabilities = None
         self._time_analysis = None
@@ -41,20 +32,27 @@ class ResidualAnalysis:
         self.time_start = None
         self.time_stop = None
 
-        if time_residual:
-            if time_binned_observed is None:
+        if "Time" in observed.axes.labels:
+            if "Time" not in expected.axes.labels:
                 raise ValueError(
-                    "time_binned_observed is required when "
-                    "time_residual=True."
+                    "Temporal analysis requires a prepared physical expected "
+                    "histogram with a Time axis."
                 )
-
+            if expected.axes != observed.axes or expected.shape != observed.shape:
+                raise ValueError(
+                    "Temporal observed and expected histograms must have "
+                    "matching Time and CDS axes."
+                )
+            print("Observed data contain time information; using temporal residual analysis.")
+            cds_labels = tuple(str(label) for label in expected.axes.labels if label != "Time")
             self._time_analysis = TimeResolvedResidualAnalysis(
-                integrated_observed=observed,
-                integrated_expected=expected,
-                time_binned_observed=time_binned_observed,
+                observed=observed,
+                integrated_expected=expected.project(*cds_labels),
             )
-            expected = self._time_analysis.build_expected()
             observed = self._time_analysis.observed_hist
+            expected = expected.to_dense(copy=False)
+        elif _announce:
+            print("Observed data have no time information; using atemporal residual analysis.")
 
         self.observed_hist = observed
         self.expected_hist = expected
@@ -135,9 +133,9 @@ class ResidualAnalysis:
 
         Args:
             observed: Observed CDS counts in the selected Time bin.
-            expected: Normalized expected CDS counts in the same Time bin.
-            integrated_expected: Integrated fitted model used to define the
-                multinomial CDS probabilities.
+            expected: Physical expected CDS counts in the same Time bin.
+            integrated_expected: Integrated expected histogram, used to check
+                the selected CDS axes.
             time_bin_index: Zero-based index of the selected Time bin.
             time_start: Physical lower boundary of the selected Time bin.
             time_stop: Physical upper boundary of the selected Time bin.
@@ -145,8 +143,7 @@ class ResidualAnalysis:
                 by the selected residual analysis.
 
         Returns:
-            A residual analysis configured with temporal plotting metadata and
-            multinomial reference probabilities.
+            A residual analysis configured with temporal plotting metadata.
         """
         if isinstance(time_bin_index, bool) or not isinstance(
             time_bin_index,
@@ -167,31 +164,15 @@ class ResidualAnalysis:
                 "have the same shape."
             )
 
-        temporal_model = np.asarray(
-            integrated_expected.to_dense(copy=True).contents,
-            dtype=float,
-        )
-        if not np.all(np.isfinite(temporal_model)):
-            raise ValueError("Integrated expected contains non-finite values.")
-        if np.any(temporal_model < 0):
-            raise ValueError("Integrated expected contains negative values.")
-
-        temporal_model_total = float(temporal_model.sum())
-        if temporal_model_total <= 0:
-            raise ValueError("Integrated expected must have a positive total.")
-
         analysis = cls(
             observed=observed,
             expected=expected,
             expected_floor=expected_floor,
+            _announce=False,
         )
         analysis.time_bin_index = int(time_bin_index)
         analysis.time_start = time_start
         analysis.time_stop = time_stop
-        analysis._temporal_total_counts = int(observed.contents.sum())
-        analysis._temporal_reference_probabilities = (
-            temporal_model / temporal_model_total
-        )
         return analysis
 
     def select_time_bin(self, time_bin_index: int) -> "ResidualAnalysis":
@@ -206,11 +187,37 @@ class ResidualAnalysis:
         if self._time_analysis is None:
             raise ValueError(
                 "select_time_bin is available only when "
-                "time_residual=True."
+                "observed data contain a Time axis."
             )
 
-        return self._time_analysis.select_time_bin(
-            time_bin_index,
+        if isinstance(time_bin_index, bool) or not isinstance(
+            time_bin_index, (int, np.integer)
+        ):
+            raise TypeError("time_bin_index must be an integer.")
+        time_axis = self.observed_hist.axes["Time"]
+        if time_bin_index < 0:
+            raise ValueError("time_bin_index must be non-negative.")
+        if time_bin_index >= time_axis.nbins:
+            raise IndexError("time_bin_index is outside the available Time bins.")
+
+        selected_axes = list(self.observed_hist.axes)[1:]
+        observed = Histogram(
+            selected_axes,
+            contents=self.observed_hist.contents[time_bin_index].copy(),
+            copy_contents=False,
+        )
+        expected = Histogram(
+            selected_axes,
+            contents=self.expected_hist.contents[time_bin_index].copy(),
+            copy_contents=False,
+        )
+        return self.from_temporal_bin(
+            observed=observed,
+            expected=expected,
+            integrated_expected=self._time_analysis.integrated_expected_hist,
+            time_bin_index=time_bin_index,
+            time_start=time_axis.edges[time_bin_index],
+            time_stop=time_axis.edges[time_bin_index + 1],
             expected_floor=self.expected_floor,
         )
 
