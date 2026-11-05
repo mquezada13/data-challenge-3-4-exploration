@@ -549,6 +549,12 @@ class PlottingResiduals:
         )
 
         if axis_name == "Time":
+            if residual_type in {"pearson", "fractional"}:
+                counts_locator = mdates.AutoDateLocator()
+                counts_axis.xaxis.set_major_locator(counts_locator)
+                counts_axis.xaxis.set_major_formatter(
+                    mdates.ConciseDateFormatter(counts_locator)
+                )
             locator = mdates.AutoDateLocator()
             residual_axis.xaxis.set_major_locator(locator)
             residual_axis.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))

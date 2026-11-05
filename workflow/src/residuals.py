@@ -3,6 +3,7 @@ import pandas as pd
 from histpy import Axis, Histogram
 import astropy.units as u
 from .time_resolved_residuals_v1 import TimeResolvedResidualAnalysis
+from .residual_statistics import build_pearson_references, residual_statistics
 
 class ResidualAnalysis:
     def __init__(
@@ -958,136 +959,18 @@ class ResidualAnalysis:
         if not requests:
             return references
 
-        expected_full = np.asarray(
-            self.masked_expected_hist.contents,
-            dtype=float,
+        return build_pearson_references(
+            requests, references,
+            masked_expected=self.masked_expected_hist,
+            expected_shape=self.expected_hist.shape,
+            temporal_probabilities_input=self._temporal_reference_probabilities,
+            temporal_total_counts=self._temporal_total_counts,
+            project_simulated_counts=self._project_simulated_counts,
+            reference_cache=self._poisson_reference_cache,
+            reference_type=reference_type,
+            n_simulations=n_simulations,
+            effective_seed=effective_seed,
         )
-
-        multinomial_probabilities = None
-        if reference_type == "multinomial":
-            temporal_probabilities = np.asarray(
-                self._temporal_reference_probabilities,
-                dtype=float,
-            )
-            if temporal_probabilities.shape != self.expected_hist.shape:
-                raise ValueError(
-                    "Temporal reference probabilities do not match the "
-                    "analysis shape."
-                )
-            if (
-                not np.all(np.isfinite(temporal_probabilities))
-                or np.any(temporal_probabilities < 0)
-            ):
-                raise ValueError(
-                    "Temporal reference probabilities must be finite and "
-                    "non-negative."
-                )
-
-            flattened_probabilities = temporal_probabilities.reshape(-1).copy()
-            retained_probability = float(flattened_probabilities.sum())
-            if retained_probability > 1.0:
-                excess = retained_probability - 1.0
-                if excess > 1e-12:
-                    raise ValueError(
-                        "Temporal reference probabilities exceed one."
-                    )
-                largest_index = int(np.argmax(flattened_probabilities))
-                flattened_probabilities[largest_index] -= excess
-                retained_probability = 1.0
-
-            outside_probability = 1.0 - retained_probability
-            multinomial_probabilities = np.append(
-                flattened_probabilities,
-                outside_probability,
-            )
-
-        def simulated_residuals(
-            simulated_full: np.ndarray,
-            request: dict[str, object],
-        ) -> np.ndarray:
-            # Apply the same mask and projection used for the observed data.
-            simulated_projection = self._project_simulated_counts(
-                simulated_full,
-                request["projection_id"],
-            )
-            projected_counts = np.asarray(
-                simulated_projection.contents,
-                dtype=float,
-            )
-            if request["phi_bin_index"] is not None:
-                projected_counts = projected_counts[request["phi_bin_index"]]
-            elif request["energy_bin_index"] is not None:
-                projected_counts = projected_counts[
-                    request["energy_bin_index"]
-                ]
-            expected_values = request["expected"]
-            valid_mask = request["valid_mask"]
-            return (
-                projected_counts[valid_mask] - expected_values[valid_mask]
-            ) / np.sqrt(expected_values[valid_mask])
-
-        # Generate each full-CDS realization once for every requested view.
-        generator = np.random.default_rng(effective_seed)
-        for _ in range(n_simulations):
-            if reference_type == "multinomial":
-                simulated_with_outside = generator.multinomial(
-                    self._temporal_total_counts,
-                    multinomial_probabilities,
-                )
-                simulated_full = simulated_with_outside[:-1].reshape(
-                    self.expected_hist.shape
-                )
-            else:
-                simulated_full = generator.poisson(expected_full)
-            for request in requests.values():
-                values = simulated_residuals(simulated_full, request)
-                request["samples"].append(values)
-                request["minimum"] = min(
-                    request["minimum"], float(np.min(values))
-                )
-                request["maximum"] = max(
-                    request["maximum"], float(np.max(values))
-                )
-
-        # Histogram the saved projected residuals; full-CDS datasets are gone.
-        density_samples = {}
-        bin_edges_by_request = {}
-        for reference_key, request in requests.items():
-            minimum = request["minimum"]
-            maximum = request["maximum"]
-            if minimum == maximum:
-                minimum -= 0.5
-                maximum += 0.5
-            bin_edges = np.linspace(minimum, maximum, request["bins"] + 1)
-            bin_edges_by_request[reference_key] = bin_edges
-            samples = request["samples"]
-            bin_widths = np.diff(bin_edges)
-            n_valid = np.count_nonzero(request["valid_mask"])
-            density_samples[reference_key] = np.empty(
-                (n_simulations, request["bins"]),
-                dtype=float,
-            )
-
-            for simulation_index, values in enumerate(samples):
-                counts = np.histogram(values, bins=bin_edges)[0]
-                density_samples[reference_key][simulation_index] = (
-                    counts / (n_valid * bin_widths)
-                )
-
-        for reference_key, request in requests.items():
-            samples = density_samples[reference_key]
-            lower, upper = np.quantile(samples, [0.025, 0.975], axis=0)
-            reference = {
-                "bin_edges": bin_edges_by_request[reference_key],
-                "density": np.mean(samples, axis=0),
-                "lower": lower,
-                "upper": upper,
-                "seed": effective_seed,
-            }
-            references[reference_key] = reference
-            self._poisson_reference_cache[request["cache_key"]] = reference
-
-        return references
 
     def data_summary_table(self) -> pd.DataFrame:
         """Describe the current observed/model histograms without projections.
@@ -1159,43 +1042,5 @@ class ResidualAnalysis:
             self.masked_expected_hist.contents[self.mask],
             dtype=float,
         )
-        difference = observed - expected
-
-        if residual_type == "raw":
-            residual_values = difference
-        elif residual_type == "pearson":
-            residual_values = difference / np.sqrt(expected)
-        else:
-            residual_values = difference / expected
-
-        summary = {
-            "Valid bins (N)": residual_values.size,
-            "Mean residual": float(np.mean(residual_values)),
-            "Median residual": float(np.median(residual_values)),
-            "Std. dev.": float(np.std(residual_values)),
-            "Residual RMS": float(np.sqrt(np.mean(residual_values**2))),
-            "Minimum residual": float(np.min(residual_values)),
-            "Maximum residual": float(np.max(residual_values)),
-        }
-
-        if residual_type == "pearson":
-            positive_observed = observed > 0
-            deviance_terms = expected.copy()
-            deviance_terms[positive_observed] += observed[positive_observed] * (
-                np.log(observed[positive_observed] / expected[positive_observed])
-                - 1.0
-            )
-            summary.update(
-                {
-                    "|R| > 2 [%]": float(
-                        100 * np.mean(np.abs(residual_values) > 2)
-                    ),
-                    "|R| > 3 [%]": float(
-                        100 * np.mean(np.abs(residual_values) > 3)
-                    ),
-                    "Pearson chi-square": float(np.sum(residual_values**2)),
-                    "Poisson deviance": float(2 * np.sum(deviance_terms)),
-                }
-            )
-
+        summary = residual_statistics(observed, expected, residual_type)
         return pd.DataFrame([summary])
