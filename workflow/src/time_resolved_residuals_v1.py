@@ -33,21 +33,67 @@ class TimeResolvedResidualAnalysis:
 
     def configure_physical_model(
         self,
-        fitted_image: Histogram,
-        response_path,
-        orientation,
-        temporal_background: Histogram,
-        background_normalization: float,
+        fitted_image: Histogram | None = None,
+        response_path=None,
+        orientation=None,
+        temporal_background: Histogram | None = None,
+        background_normalization: float | None = None,
         *,
         earth_occ: bool,
         nside_scatt_map: int | None = None,
+        fitted_model=None,
+        extended_sky_axis=None,
+        fitted_energy_axis=None,
+        fitted_background: Histogram | None = None,
     ) -> None:
         """Set the inputs for physical predictions and clear cached bins.
 
         Keep the supplied objects unchanged while using cached predictions.
         Call this method again after changing any input or response setting.
         The response file is opened only when new bins are calculated.
+
+        For a parametric COSIpy/3ML fit, supply ``fitted_model`` (the
+        optimized astromodels Model), ``extended_sky_axis`` from the fitted
+        extended response, its ``fitted_energy_axis``, and the integrated
+        ``fitted_background``. Its
+        normalization is derived from the temporal background and checked
+        against every CDS bin. Point-source folding currently requires Earth
+        occultation, as in COSIpy's point-source response implementation.
         """
+        if fitted_image is not None and not isinstance(fitted_image, Histogram):
+            from astromodels import Model
+
+            if isinstance(fitted_image, Model) and fitted_model is None:
+                fitted_model, fitted_image = fitted_image, None
+            else:
+                raise TypeError("The fitted sky must be a Histogram or an astromodels Model.")
+        if fitted_model is not None:
+            from astromodels import Model
+
+            if fitted_image is not None or not isinstance(fitted_model, Model):
+                raise ValueError("Provide one fitted image or one astromodels Model.")
+            if extended_sky_axis is None or fitted_energy_axis is None or fitted_background is None:
+                raise ValueError("A parametric model requires the fitted sky and energy axes and background.")
+            if background_normalization is not None:
+                raise ValueError("For a parametric model provide fitted_background, not a scale.")
+            if not earth_occ:
+                raise ValueError("Parametric point-source folding currently requires earth_occ=True.")
+            if temporal_background.axes != self.observed_hist.axes:
+                raise ValueError("Temporal background and observed data must have matching axes.")
+            if fitted_background.axes != self.integrated_expected_hist.axes:
+                raise ValueError("Fitted background and integrated model axes must match.")
+            cds_labels = tuple(str(label) for label in fitted_background.axes.labels)
+            template = temporal_background.project(*cds_labels).to_dense(copy=False)
+            template_values = np.asarray(template.contents, dtype=float)
+            fitted_values = np.asarray(fitted_background.contents, dtype=float)
+            if (not np.all(np.isfinite(template_values)) or np.any(template_values < 0)
+                    or not np.all(np.isfinite(fitted_values)) or np.any(fitted_values < 0)
+                    or template_values.sum() <= 0):
+                raise ValueError("Background counts must be finite, non-negative, and non-empty.")
+            background_normalization = float(fitted_values.sum() / template_values.sum())
+            if not np.allclose(fitted_values, template_values * background_normalization,
+                               rtol=1e-8, atol=1e-12):
+                raise ValueError("Fitted background is not a single scaled temporal template.")
         self._physical_configuration = {
             "fitted_image": fitted_image,
             "response_path": response_path,
@@ -57,6 +103,10 @@ class TimeResolvedResidualAnalysis:
             "earth_occ": earth_occ,
             "nside_scatt_map": nside_scatt_map,
         }
+        if fitted_model is not None:
+            self._physical_configuration["fitted_model"] = fitted_model
+            self._physical_configuration["extended_sky_axis"] = extended_sky_axis
+            self._physical_configuration["fitted_energy_axis"] = fitted_energy_axis
         self._physical_cache.clear()
 
     def build_physical_time_range(
@@ -95,9 +145,13 @@ class TimeResolvedResidualAnalysis:
 
             configuration = self._physical_configuration.copy()
             response_path = configuration.pop("response_path")
+            is_parametric = "fitted_model" in configuration
+            if is_parametric:
+                configuration.pop("fitted_image")
             with FullDetectorResponse.open(response_path) as detector_response:
                 for index in missing:
-                    products = self.build_physical_time_bin(
+                    builder = self._build_parametric_time_bin if is_parametric else self.build_physical_time_bin
+                    products = builder(
                         time_bin_index=index,
                         detector_response=detector_response,
                         **configuration,
@@ -125,6 +179,108 @@ class TimeResolvedResidualAnalysis:
             copy_contents=False,
         )
         return observed, expected
+
+    def _build_parametric_time_bin(
+        self, time_bin_index, fitted_model, extended_sky_axis, fitted_energy_axis,
+        detector_response, orientation, temporal_background,
+        background_normalization, *, earth_occ, nside_scatt_map=None,
+    ):
+        """Fold an unpolarized COSIpy/3ML model for one time interval.
+
+        Point sources use COSIpy's point-source folding; extended sources
+        use its integrated flux maps and the existing pixel-wise folding.
+        The result is provisional until its response is checked against the
+        integrated fit. Three-dimensional spatial models are not yet supported.
+        """
+        import astropy.units as u
+        from astropy.coordinates import Galactic
+        from astropy.time import Time
+        from astromodels import Function3D
+        from astromodels.sources import PointSource, ExtendedSource
+        from histpy import HealpixAxis
+        from cosipy.data_io import EmCDSBinnedData
+        from cosipy.response import BinnedInstrumentResponse, BinnedThreeMLPointSourceResponse
+        from cosipy.response.functions import get_integrated_extended_model
+        from cosipy.threeml.util import to_linear_polarization
+
+        if fitted_energy_axis != detector_response.axes["Ei"]:
+            raise ValueError("Fitted and detector response energy bins do not match.")
+        image_axis = HealpixAxis(nside=extended_sky_axis.nside, coordsys="galactic",
+                                 scheme="ring", label="lb")
+        indices = np.arange(image_axis.npix)
+        if (not isinstance(extended_sky_axis.coordsys, Galactic)
+                or not np.allclose(image_axis.pix2ang(indices), extended_sky_axis.pix2ang(indices))):
+            raise ValueError("The fitted sky axis must use the same Galactic RING pixelization.")
+
+        edges = self.observed_hist.axes["Time"].edges.to_value(u.s)
+        interval = orientation.select_interval(
+            Time(edges[time_bin_index], format="unix"),
+            Time(edges[time_bin_index + 1], format="unix"),
+        )
+        data = EmCDSBinnedData(self.integrated_expected_hist)
+        source_values = np.zeros(self.integrated_expected_hist.shape, dtype=float)
+        extended_values = None
+        extended_unit = None
+        for source in fitted_model.sources.values():
+            if not isinstance(source, (PointSource, ExtendedSource)):
+                raise TypeError("Only point and extended sources are supported.")
+            if not hasattr(source.spectrum, "main"):
+                raise ValueError("Only single-component, unpolarized spectra are supported.")
+            polarization = to_linear_polarization(source.spectrum.main.polarization)
+            if polarization.degree.value != 0:
+                raise ValueError("Polarized sources are not supported by temporal folding.")
+            if isinstance(source, PointSource):
+                instrument = BinnedInstrumentResponse(detector_response, data)
+                point_response = BinnedThreeMLPointSourceResponse(
+                    data=data, instrument_response=instrument, sc_history=interval,
+                    energy_axis=fitted_energy_axis,
+                    nside=nside_scatt_map or 2 * data.axes["PsiChi"].nside,
+                )
+                point_response.set_source(source)
+                expected = point_response.expectation()
+            else:
+                if isinstance(source.spatial_shape, Function3D):
+                    raise ValueError("Three-dimensional spatial models are not yet supported.")
+                flux = get_integrated_extended_model(source, extended_sky_axis, fitted_energy_axis)
+                flux_values = np.asarray(flux.contents, dtype=float)
+                if not np.all(np.isfinite(flux_values)) or np.any(flux_values < 0):
+                    raise ValueError("The fitted sky image contains invalid values.")
+                if flux.unit is None:
+                    raise ValueError("The fitted sky image must have physical units.")
+                if extended_values is None:
+                    extended_unit = flux.unit
+                    extended_values = flux_values.copy()
+                else:
+                    extended_values += flux_values * flux.unit.to(extended_unit)
+                continue
+            if expected.axes != self.integrated_expected_hist.axes:
+                raise ValueError("Source expectation and fitted CDS axes do not match.")
+            source_values += np.asarray(expected.contents, dtype=float)
+
+        if extended_values is not None:
+            image = Histogram([image_axis, fitted_energy_axis],
+                              contents=extended_values, unit=extended_unit)
+            expected = self.build_physical_time_bin(
+                time_bin_index=time_bin_index, fitted_image=image,
+                detector_response=detector_response, orientation=orientation,
+                temporal_background=temporal_background, background_normalization=0.0,
+                earth_occ=earth_occ, nside_scatt_map=nside_scatt_map,
+            )["source"]
+            if expected.axes != self.integrated_expected_hist.axes:
+                raise ValueError("Source expectation and fitted CDS axes do not match.")
+            source_values += np.asarray(expected.contents, dtype=float)
+
+        background_values = temporal_background.contents[time_bin_index]
+        if hasattr(background_values, "todense"):
+            background_values = background_values.todense()
+        background_values = np.asarray(background_values, dtype=float)
+        if not np.all(np.isfinite(background_values)) or np.any(background_values < 0):
+            raise ValueError("Temporal background contains invalid counts.")
+        axes = list(self.integrated_expected_hist.axes)
+        source = Histogram(axes, contents=source_values)
+        background = Histogram(axes, contents=background_normalization * background_values)
+        total = Histogram(axes, contents=source_values + background.contents)
+        return {"source": source, "background": background, "total": total}
 
     # ----------------------------------------------------------------------
     # Expected counts M(t,i)

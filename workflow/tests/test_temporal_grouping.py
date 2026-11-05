@@ -36,3 +36,43 @@ def test_grouping_uses_original_edges_and_cached_counts():
     for invalid in (True, 1.5):
         with pytest.raises(TypeError):
             builder.build_physical_time_range(bins_per_group=invalid)
+
+
+def test_parametric_dispatch_reuses_bins_and_checks_background(monkeypatch):
+    """Route a fitted model through the shared range and reject incompatible backgrounds."""
+    from astromodels import Model, PointSource, Powerlaw
+    from cosipy.response import FullDetectorResponse
+
+    time = Axis([0, 1, 2, 3], label="Time", unit=u.s)
+    phi = Axis([0, 1, 2], label="Phi", unit=u.deg)
+    temporal = Histogram([time, phi], contents=np.ones((3, 2)))
+    integrated = Histogram([phi], contents=np.array([3.0, 3.0]))
+    fitted_background = Histogram([phi], contents=np.array([6.0, 6.0]))
+    model = Model(PointSource("source", ra=0, dec=0, spectral_shape=Powerlaw()))
+    builder = TimeResolvedResidualAnalysis(temporal, integrated)
+    builder.configure_physical_model(
+        fitted_image=model, response_path="unused", orientation=None,
+        temporal_background=temporal, fitted_background=fitted_background,
+        extended_sky_axis=object(), fitted_energy_axis=object(), earth_occ=True,
+    )
+    calls = []
+    def fake_bin(time_bin_index, **kwargs):
+        calls.append(time_bin_index)
+        return {"total": Histogram([phi], contents=np.full(2, time_bin_index + 1.0))}
+
+    from unittest.mock import MagicMock
+    monkeypatch.setattr(FullDetectorResponse, "open", MagicMock())
+    monkeypatch.setattr(builder, "_build_parametric_time_bin", fake_bin)
+    builder.build_physical_time_range(0, 2)
+    _, result = builder.build_physical_time_range(1, 3)
+    np.testing.assert_array_equal(result.contents[:, 0], [2, 3])
+    assert calls == [0, 1, 2]
+    assert builder._physical_configuration["background_normalization"] == 2.0
+
+    incompatible = Histogram([phi], contents=np.array([6.0, 7.0]))
+    with pytest.raises(ValueError, match="single scaled"):
+        builder.configure_physical_model(
+            fitted_model=model, response_path="unused", orientation=None,
+            temporal_background=temporal, fitted_background=incompatible,
+            extended_sky_axis=object(), fitted_energy_axis=object(), earth_occ=True,
+        )
