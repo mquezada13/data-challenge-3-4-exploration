@@ -27,7 +27,7 @@ class TimeResolvedResidualAnalysis:
                 raise ValueError(f"Observed D(t,i) and integrated M have incompatible {label} bins.")
 
         self.integrated_expected_hist = integrated_expected
-        self.observed_hist = self._densify_observed_counts(observed)
+        self.observed_hist = observed if observed.is_sparse else self._densify_observed_counts(observed)
         self._physical_configuration = None
         self._physical_cache = {}
 
@@ -53,9 +53,9 @@ class TimeResolvedResidualAnalysis:
         The response file is opened only when new bins are calculated.
 
         For a parametric COSIpy/3ML fit, supply ``fitted_model`` (the
-        optimized astromodels Model), ``extended_sky_axis`` from the fitted
-        extended response, its ``fitted_energy_axis``, and the integrated
-        ``fitted_background``. Its
+        optimized astromodels Model), ``fitted_energy_axis``, and the integrated
+        ``fitted_background``. Extended sources also require ``extended_sky_axis``
+        from the fitted extended response. Background
         normalization is derived from the temporal background and checked
         against every CDS bin. Point-source folding currently requires Earth
         occultation, as in COSIpy's point-source response implementation.
@@ -69,11 +69,16 @@ class TimeResolvedResidualAnalysis:
                 raise TypeError("The fitted sky must be a Histogram or an astromodels Model.")
         if fitted_model is not None:
             from astromodels import Model
+            from astromodels.sources import ExtendedSource
 
             if fitted_image is not None or not isinstance(fitted_model, Model):
                 raise ValueError("Provide one fitted image or one astromodels Model.")
-            if extended_sky_axis is None or fitted_energy_axis is None or fitted_background is None:
-                raise ValueError("A parametric model requires the fitted sky and energy axes and background.")
+            if fitted_energy_axis is None or fitted_background is None:
+                raise ValueError("A parametric model requires the fitted energy axis and background.")
+            if extended_sky_axis is None and any(
+                isinstance(source, ExtendedSource) for source in fitted_model.sources.values()
+            ):
+                raise ValueError("Extended sources require the fitted sky axis.")
             if background_normalization is not None:
                 raise ValueError("For a parametric model provide fitted_background, not a scale.")
             if not earth_occ:
@@ -160,6 +165,8 @@ class TimeResolvedResidualAnalysis:
 
         time_axis = self.observed_hist.axes["Time"][start:stop]
         observed_values = self.observed_hist.contents[start:stop].copy()
+        if hasattr(observed_values, "todense"):
+            observed_values = observed_values.todense()
         expected_values = np.stack([self._physical_cache[index] for index in range(start, stop)])
         if bins_per_group > 1:
             # Keep the original time boundaries and sum complete groups.
@@ -205,12 +212,15 @@ class TimeResolvedResidualAnalysis:
 
         if fitted_energy_axis != detector_response.axes["Ei"]:
             raise ValueError("Fitted and detector response energy bins do not match.")
-        image_axis = HealpixAxis(nside=extended_sky_axis.nside, coordsys="galactic",
-                                 scheme="ring", label="lb")
-        indices = np.arange(image_axis.npix)
-        if (not isinstance(extended_sky_axis.coordsys, Galactic)
-                or not np.allclose(image_axis.pix2ang(indices), extended_sky_axis.pix2ang(indices))):
-            raise ValueError("The fitted sky axis must use the same Galactic RING pixelization.")
+        if any(isinstance(source, ExtendedSource) for source in fitted_model.sources.values()):
+            if extended_sky_axis is None:
+                raise ValueError("Extended sources require the fitted sky axis.")
+            image_axis = HealpixAxis(nside=extended_sky_axis.nside, coordsys="galactic",
+                                     scheme="ring", label="lb")
+            indices = np.arange(image_axis.npix)
+            if (not isinstance(extended_sky_axis.coordsys, Galactic)
+                    or not np.allclose(image_axis.pix2ang(indices), extended_sky_axis.pix2ang(indices))):
+                raise ValueError("The fitted sky axis must use the same Galactic RING pixelization.")
 
         edges = self.observed_hist.axes["Time"].edges.to_value(u.s)
         interval = orientation.select_interval(

@@ -9,14 +9,18 @@ from src.residuals import ResidualAnalysis
 from src.time_resolved_residuals_v1 import TimeResolvedResidualAnalysis
 
 
-def test_grouping_uses_original_edges_and_cached_counts():
+@pytest.mark.parametrize("sparse_observed", [False, True])
+def test_grouping_uses_original_edges_and_cached_counts(sparse_observed):
     """Group cached counts without changing the native-resolution result."""
     time = Axis([0, 1, 3, 6, 10], label="Time", unit=u.s)
     phi = Axis([0, 1, 2], label="Phi", unit=u.deg)
     values = np.array([[200, 1], [100, 2], [4, 3], [5, 4]], dtype=np.uint8)
     observed = Histogram([time, phi], contents=values)
+    if sparse_observed:
+        observed = observed.to_sparse()
     integrated = Histogram([phi], contents=np.ones(2))
     builder = TimeResolvedResidualAnalysis(observed, integrated)
+    assert builder.observed_hist.is_sparse == sparse_observed
     builder.configure_physical_model(None, "unused.h5", None, observed, 1, earth_occ=True)
     builder._physical_cache = {i: np.array([i + 1.0, 2.0]) for i in range(4)}
 
@@ -40,7 +44,7 @@ def test_grouping_uses_original_edges_and_cached_counts():
 
 def test_parametric_dispatch_reuses_bins_and_checks_background(monkeypatch):
     """Route a fitted model through the shared range and reject incompatible backgrounds."""
-    from astromodels import Model, PointSource, Powerlaw
+    from astromodels import ExtendedSource, Gaussian_on_sphere, Model, PointSource, Powerlaw
     from cosipy.response import FullDetectorResponse
 
     time = Axis([0, 1, 2, 3], label="Time", unit=u.s)
@@ -53,7 +57,7 @@ def test_parametric_dispatch_reuses_bins_and_checks_background(monkeypatch):
     builder.configure_physical_model(
         fitted_image=model, response_path="unused", orientation=None,
         temporal_background=temporal, fitted_background=fitted_background,
-        extended_sky_axis=object(), fitted_energy_axis=object(), earth_occ=True,
+        fitted_energy_axis=object(), earth_occ=True,
     )
     calls = []
     def fake_bin(time_bin_index, **kwargs):
@@ -68,6 +72,21 @@ def test_parametric_dispatch_reuses_bins_and_checks_background(monkeypatch):
     np.testing.assert_array_equal(result.contents[:, 0], [2, 3])
     assert calls == [0, 1, 2]
     assert builder._physical_configuration["background_normalization"] == 2.0
+
+    extended_model = Model(ExtendedSource(
+        "extended", spatial_shape=Gaussian_on_sphere(), spectral_shape=Powerlaw()
+    ))
+    with pytest.raises(ValueError, match="Extended sources require"):
+        builder.configure_physical_model(
+            fitted_model=extended_model, response_path="unused", orientation=None,
+            temporal_background=temporal, fitted_background=fitted_background,
+            fitted_energy_axis=object(), earth_occ=True,
+        )
+    builder.configure_physical_model(
+        fitted_model=extended_model, response_path="unused", orientation=None,
+        temporal_background=temporal, fitted_background=fitted_background,
+        extended_sky_axis=object(), fitted_energy_axis=object(), earth_occ=True,
+    )
 
     incompatible = Histogram([phi], contents=np.array([6.0, 7.0]))
     with pytest.raises(ValueError, match="single scaled"):
