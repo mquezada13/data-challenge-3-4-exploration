@@ -95,6 +95,13 @@ class ResidualAnalysis:
                 )
         # Build and store the mask and its report.
         self.mask, self.mask_report = self.mask_function()
+        self._reliable_expected_contents = None
+        if self.mask_report["occupied_floor_bins"]:
+            self._reliable_expected_contents = np.where(
+                self.expected_hist.contents > self.mask_report["floor_threshold"],
+                self.expected_hist.contents,
+                0.0,
+            )
 
         # Create masked copies without changing the original histograms.
         self.masked_observed_hist = Histogram(
@@ -235,19 +242,10 @@ class ResidualAnalysis:
         # Identify bins at or below the selected floor.
         floor_mask = self.expected_hist.contents <= exclusion_threshold
 
-        # Do not silently exclude bins that contain observed events.
-        observed_at_floor = self.observed_hist.contents[
-            floor_mask
-        ].sum()
-
-        # Ensure that the mask retains data for the residual calculation.
-        if observed_at_floor > 0:
-            raise ValueError(
-                "Expected-floor bins contain observed events and cannot "
-                "be excluded automatically."
-            )
-        # Exclude only floor bins that contain no observed events.
-        valid_mask = ~floor_mask
+        # Retain observed events even when their expectation is at the floor.
+        occupied_floor = floor_mask & (self.observed_hist.contents > 0)
+        observed_at_floor = self.observed_hist.contents[occupied_floor].sum()
+        valid_mask = ~floor_mask | occupied_floor
 
         # Ensure that the mask retains data for the residual calculation.
         if not np.any(valid_mask):
@@ -259,7 +257,10 @@ class ResidualAnalysis:
             "total_bins": valid_mask.size,
             "valid_bins": np.count_nonzero(valid_mask),
             "excluded_bins": np.count_nonzero(~valid_mask),
-            "observed_counts_excluded": observed_at_floor,
+            "observed_counts_excluded": 0.0,
+            "occupied_floor_bins": int(np.count_nonzero(occupied_floor)),
+            "observed_counts_at_floor": float(observed_at_floor),
+            "floor_threshold": exclusion_threshold,
             "expected_floor": self.expected_floor,
             "minimum_expected": self.expected_hist.contents.min(),
             "minimum_retained_expected": self.expected_hist.contents[
@@ -406,6 +407,21 @@ class ResidualAnalysis:
             selected_expected,
             expected_floor=self.expected_floor,
         )
+
+        # Preserve non-floor support when several energy bins are aggregated.
+        if self._reliable_expected_contents is not None:
+            selected_analysis._reliable_expected_contents = np.sum(
+                self._reliable_expected_contents[selection],
+                axis=energy_axis_index,
+                keepdims=True,
+            )
+            unsupported = (selected_observed_contents > 0) & (
+                selected_analysis._reliable_expected_contents <= 0
+            )
+            selected_analysis.mask_report["occupied_floor_bins"] = int(np.count_nonzero(unsupported))
+            selected_analysis.mask_report["observed_counts_at_floor"] = float(
+                selected_observed_contents[unsupported].sum()
+            )
 
         # Preserve the selected time interval in the energy-selected analysis.
         selected_analysis.time_bin_index = self.time_bin_index
@@ -663,8 +679,13 @@ class ResidualAnalysis:
 
         # Calculate the observed-minus-expected difference.
         difference = observed_hist - expected_hist
-        # Keep only bins with positive projected expectation for normalized residuals.
+        # Normalized residuals require a projected non-floor model contribution.
         valid_mask = expected_hist.contents > 0
+        if self._reliable_expected_contents is not None:
+            reliable_projection = self._project_simulated_counts(
+                self._reliable_expected_contents, projection_id
+            )
+            valid_mask &= reliable_projection.contents > 0
 
         if residual_type == "raw":
             residual = difference
@@ -937,8 +958,8 @@ class ResidualAnalysis:
                 expected_values = expected_values[energy_bin_index]
                 observed_values = observed_values[energy_bin_index]
 
-            valid_mask = expected_values > 0
-            observed_values = observed_values[np.isfinite(observed_values)]
+            valid_mask = (expected_values > 0) & np.isfinite(observed_values)
+            observed_values = observed_values[valid_mask]
             if observed_values.size == 0 or not np.any(valid_mask):
                 raise ValueError("No valid Pearson residual bins are available.")
 
@@ -997,6 +1018,8 @@ class ResidualAnalysis:
             ("Total bins", int(self.mask.size)),
             ("Valid bins", valid_bins),
             ("Excluded bins", int(self.mask.size) - valid_bins),
+            ("Occupied floor bins retained", self.mask_report["occupied_floor_bins"]),
+            ("Observed counts at floor", self.mask_report["observed_counts_at_floor"]),
             ("Observed counts (all bins)", float(self.observed_hist.contents.sum())),
             ("Expected counts (all bins)", float(self.expected_hist.contents.sum())),
             ("Observed counts (valid bins)", float(self.observed_hist.contents[self.mask].sum())),
@@ -1032,6 +1055,12 @@ class ResidualAnalysis:
             raise ValueError(
                 "Select an energy interval before calculating full-CDS "
                 "statistics."
+            )
+
+        if residual_type != "raw" and self.mask_report["occupied_floor_bins"]:
+            raise ValueError(
+                "Normalized full-CDS statistics are undefined for occupied "
+                "bins at the expectation floor."
             )
 
         observed = np.asarray(

@@ -224,13 +224,11 @@ class PlottingResiduals:
                 If omitted, the constructor setting is used. When simulations
                 are enabled without a seed, one seed is generated and reused.
             show_gaussian_reference: Whether to overlay the theoretical
-                standard normal curve. By default it is shown without
-                simulations and hidden when simulations are requested.
+                standard normal curve. Disabled by default.
             energy_bin_index: Em-bin index for a slice of
                 ``"Em_PsiChi_projection"``.
             show_uncertainty: Show the existing nominal count uncertainty band.
-                By default it is hidden for physical temporal analyses and
-                retained for other analyses.
+                Disabled by default.
 
         Returns:
             The Matplotlib figure containing the requested diagnostic.
@@ -299,7 +297,7 @@ class PlottingResiduals:
                 )
 
         if show_gaussian_reference is None:
-            show_gaussian = residual_type == "pearson" and plot_n_simulations is None
+            show_gaussian = False
         else:
             show_gaussian = show_gaussian_reference
 
@@ -482,12 +480,8 @@ class PlottingResiduals:
             "_temporal_total_counts",
             None,
         )
-        physical_temporal = (
-            getattr(self.analysis, "_time_analysis", None) is not None
-            or getattr(self.analysis, "time_bin_index", None) is not None
-        ) and temporal_total is None
         if show_uncertainty is None:
-            show_uncertainty = not physical_temporal
+            show_uncertainty = False
         if temporal_total is None:
             count_sigma = np.sqrt(expected_values)
             uncertainty_label = r"Poisson uncertainty ($\pm 1\sigma$)"
@@ -563,7 +557,14 @@ class PlottingResiduals:
             residual_axis.set_xlabel(f"{axis_name} [{axis_unit}]")
         residual_axis.set_ylabel(f"{residual_type.capitalize()} residual")
         if residual_type == "pearson":
-            residual_axis.set_ylim(-5.0, 5.0)
+            # Keep the nominal reference range while showing all finite points.
+            finite_values = np.asarray(residual_values, dtype=float)
+            finite_values = finite_values[np.isfinite(finite_values)]
+            lower, upper = -5.0, 5.0
+            if finite_values.size:
+                lower = min(lower, 1.1 * float(np.min(finite_values)))
+                upper = max(upper, 1.1 * float(np.max(finite_values)))
+            residual_axis.set_ylim(lower, upper)
         residual_axis.grid(alpha=0.2)
 
         if running_mean_window is not None:
@@ -648,41 +649,6 @@ class PlottingResiduals:
                 linestyle=":",
                 linewidth=1,
             )
-
-            if residual_type == "pearson":
-                # Highlight the nominal three-sigma Pearson residual range.
-                residual_axis.axhspan(
-                    -3.0,
-                    3.0,
-                    color="limegreen",
-                    alpha=0.15,
-                    label=r"$\pm3\sigma$ range",
-                    zorder=0,
-                )
-
-                # Mark the one- and two-sigma levels above the shared band.
-                for level, linestyle in (
-                    (1.0, ":"),
-                    (2.0, "--"),
-                ):
-                    residual_axis.axhline(
-                        level,
-                        color="limegreen",
-                        linestyle=linestyle,
-                        linewidth=1.2,
-                        label=rf"$\pm{level:.0f}\sigma$",
-                    )
-                    residual_axis.axhline(
-                        -level,
-                        color="limegreen",
-                        linestyle=linestyle,
-                        linewidth=1.2,
-                    )
-                residual_axis.legend(
-                    loc="upper right",
-                    ncol=3,
-                    fontsize="small",
-                )
 
             if residual_type == "pearson" and show_gaussian_reference:
                 # Compare Pearson residuals with the standard normal density.

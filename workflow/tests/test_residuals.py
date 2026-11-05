@@ -97,8 +97,8 @@ def test_mask_excludes_only_numerical_floor_bins_without_events():
     assert analysis.mask_report["observed_counts_excluded"] == 0.0
 
 
-def test_configured_expected_floor_excludes_empty_bins_and_rejects_events():
-    """A configured artificial floor is masked only for empty bins."""
+def test_configured_expected_floor_excludes_empty_bins_and_retains_events():
+    """A configured floor excludes empty bins but retains observed events."""
     expected_floor = 1e-12
     expected = make_histogram([2.0, expected_floor])
 
@@ -113,14 +113,13 @@ def test_configured_expected_floor_excludes_empty_bins_and_rejects_events():
     assert analysis.mask_report["excluded_bins"] == 1
     assert analysis.mask_report["expected_floor"] == expected_floor
 
-    # A floor bin containing observed events must raise instead of hiding data.
+    # A floor bin containing observed events is retained and reported.
     observed_with_floor_events = make_histogram([3.0, 1.0])
-    with pytest.raises(ValueError, match="contain observed events"):
-        ResidualAnalysis(
-            observed_with_floor_events,
-            expected,
-            expected_floor=expected_floor,
-        )
+    analysis = ResidualAnalysis(observed_with_floor_events, expected, expected_floor=expected_floor)
+    np.testing.assert_array_equal(analysis.mask, [True, True])
+    assert analysis.mask_report["occupied_floor_bins"] == 1
+    assert analysis.mask_report["observed_counts_at_floor"] == 1.0
+    assert analysis.mask_report["observed_counts_excluded"] == 0.0
 
 
 def test_pearson_poisson_reference_is_reproducible():
@@ -383,13 +382,55 @@ def test_constructor_phi_slice_does_not_affect_integrated_psichi_plot(monkeypatc
     assert result is None
 
 
-def test_mask_rejects_observed_events_with_zero_expectation():
-    """Observed events cannot be silently masked when expectation is zero."""
+def test_mask_retains_observed_events_with_zero_expectation():
+    """Observed events are retained and their normalized residual is undefined."""
     observed = make_histogram([0.0, 1.0])
     expected = make_histogram([2.0, 0.0])
 
-    with pytest.raises(ValueError, match="contain observed events"):
-        ResidualAnalysis(observed, expected)
+    analysis = ResidualAnalysis(observed, expected)
+    analysis._projected_data_cache = {"Phi_projection": analysis.projection_function("Phi")}
+    np.testing.assert_array_equal(analysis.mask, [True, True])
+    assert analysis.mask_report["observed_counts_at_floor"] == 1.0
+    assert np.isnan(analysis.residual_function("Phi_projection", "pearson").contents[1])
+    assert analysis.residual_function("Phi_projection", "raw").contents[1] == 1.0
+    with pytest.raises(ValueError, match="Normalized full-CDS"):
+        analysis.statistics_table("pearson")
+
+
+def test_projection_retains_floor_events_with_supported_expectation():
+    """Floor events contribute after projection when other bins support the model."""
+    axes = [Axis([0, 1, 2], label="Phi", unit=u.deg), Axis([0, 1, 2], label="Other")]
+    observed = Histogram(axes, contents=np.array([[1., 4.], [2., 0.]]))
+    expected = Histogram(axes, contents=np.array([[0., 3.], [0., 0.]]))
+    analysis = ResidualAnalysis(observed, expected)
+    analysis._projected_data_cache = {"Phi_projection": analysis.projection_function("Phi")}
+    raw = analysis.residual_function("Phi_projection", "raw").contents
+    pearson = analysis.residual_function("Phi_projection", "pearson").contents
+    np.testing.assert_allclose(raw, [2., 2.])
+    assert pearson[0] == pytest.approx(2. / np.sqrt(3.))
+    assert np.isnan(pearson[1])
+
+
+def test_energy_selection_preserves_floor_only_provenance():
+    """Summing floor-only bins must not turn them into model support."""
+    axes = [
+        Axis([100, 200, 300], label="Em", unit=u.keV),
+        Axis([0, 1], label="Phi", unit=u.deg),
+        HealpixAxis(nside=1, scheme="RING", coordsys="galactic", label="PsiChi"),
+    ]
+    observed_values = np.zeros((2, 1, 12))
+    expected_values = np.zeros((2, 1, 12))
+    observed_values[:, 0, 0] = 1.0
+    expected_values[:, 0, 0] = 1e-12
+    expected_values[:, 0, 1] = 1.0
+    analysis = ResidualAnalysis(
+        Histogram(axes, contents=observed_values),
+        Histogram(axes, contents=expected_values),
+        expected_floor=1e-12,
+    )
+    selected = analysis.select_energy_range(100, 300)
+    assert selected.mask_report["observed_counts_at_floor"] == 2.0
+    assert np.isnan(selected.residual_function("PsiChi_projection", "pearson").contents[0])
 
 
 def test_mask_rejects_histograms_with_no_valid_bins():
@@ -1062,8 +1103,22 @@ def test_temporal_1d_plot_labels_model_and_utc_interval():
     plt.close(figure)
 
 
-def test_pearson_plot_uses_limegreen_sigma_guides():
-    """Pearson plots use a three-sigma band and distinct inner guide lines."""
+def test_pearson_plot_expands_limits_to_include_residuals():
+    """Both positive and negative outliers remain visible on the residual axis."""
+    analysis = make_poisson_reference_analysis(
+        expected_values=[100.0, 1.0], observed_values=[0.0, 21.0],
+    )
+    figure = PlottingResiduals(analysis).plot(
+        "Phi_projection", residual_type="pearson", show_gaussian_reference=False,
+    )
+    lower, upper = figure.axes[1].get_ylim()
+    assert lower < -10.0
+    assert upper > 20.0
+    plt.close(figure)
+
+
+def test_pearson_plot_omits_statistical_guides_by_default():
+    """Default Pearson plots show residuals without uncalibrated references."""
     analysis = make_poisson_reference_analysis(
         expected_values=[3.0, 4.0, 5.0],
         observed_values=[2.0, 5.0, 5.0],
@@ -1072,35 +1127,17 @@ def test_pearson_plot_uses_limegreen_sigma_guides():
     figure = PlottingResiduals(analysis).plot(
         "Phi_projection",
         residual_type="pearson",
-        n_simulations=4,
-        random_seed=17,
     )
     residual_axis = figure.axes[1]
-
-    sigma_band = next(
-        patch
-        for patch in residual_axis.patches
-        if patch.get_label() == r"$\pm3\sigma$ range"
-    )
-    np.testing.assert_allclose(
-        sigma_band.get_facecolor(),
-        matplotlib.colors.to_rgba("limegreen", alpha=0.15),
-    )
+    assert not residual_axis.patches
     assert residual_axis.get_ylim() == (-5.0, 5.0)
-
-    labeled_lines = {
-        line.get_label(): line
-        for line in residual_axis.lines
-    }
-    assert labeled_lines[r"$\pm1\sigma$"].get_color() == "limegreen"
-    assert labeled_lines[r"$\pm1\sigma$"].get_linestyle() == ":"
-    assert labeled_lines[r"$\pm2\sigma$"].get_color() == "limegreen"
-    assert labeled_lines[r"$\pm2\sigma$"].get_linestyle() == "--"
     counts_legend_labels = [
         text.get_text()
         for text in figure.axes[0].get_legend().get_texts()
     ]
-    assert r"Poisson uncertainty ($\pm 1\sigma$)" in counts_legend_labels
+    assert r"Poisson uncertainty ($\pm 1\sigma$)" not in counts_legend_labels
+    distribution_labels = [line.get_label() for line in figure.axes[2].lines]
+    assert r"Standard normal $N(0,1)$" not in distribution_labels
     plt.close(figure)
 
 
