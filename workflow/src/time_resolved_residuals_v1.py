@@ -289,6 +289,41 @@ class TemporalPredictionBuilder:
         )
         return observed, expected
 
+    def timestamps_interval(
+        self, start_time, stop_time, *, bins_per_group: int = 1
+    ) -> tuple[Histogram, Histogram]:
+        """Build physical predictions for the bins containing two timestamps.
+
+        Args:
+            start_time: UTC ISO timestamp string or scalar astropy Time.
+            stop_time: UTC ISO timestamp string or scalar astropy Time.
+            bins_per_group: Number of consecutive original bins per output bin.
+
+        Returns:
+            Matching observed and expected histograms. Their Time axis contains
+            the actual selected bin edges.
+
+        Both timestamps are included. A timestamp on an internal bin edge
+        belongs to the bin beginning at that edge. The final observation edge
+        is excluded because no bin begins there. Both timestamps may be within
+        the same bin. Grouping requires a whole number of groups.
+        """
+        from astropy.time import Time
+
+        # Convert the validated timestamps and native edges to bin indices.
+        start_time, stop_time = self._validate_timestamps(start_time, stop_time)
+        edges = Time(
+            self.observed_hist.axes["Time"].edges.to_value("s"),
+            format="unix", scale="utc",
+        )
+        start_index = int(np.count_nonzero(edges <= start_time)) - 1
+        stop_index = int(np.count_nonzero(edges <= stop_time))
+
+        # Use the existing prediction, grouping, and cache implementation.
+        return self.build_physical_time_range(
+            start=start_index, stop=stop_index, bins_per_group=bins_per_group
+        )
+
     def build_parametric_time_bin(
         self, 
         time_bin_index : int, 
@@ -819,6 +854,35 @@ class TemporalPredictionBuilder:
         if bins_per_group < 1 or (stop - start) % bins_per_group:
             raise ValueError("bins_per_group must be positive and divide the selected range exactly.")
         return stop
+
+    def _validate_timestamps(self, start_time, stop_time):
+        """Validate scalar timestamps against the original observation edges."""
+        from astropy.time import Time
+
+        times = []
+        for name, value in (("start_time", start_time), ("stop_time", stop_time)):
+            if not isinstance(value, (str, Time)):
+                raise TypeError(f"{name} must be a UTC timestamp string or astropy Time.")
+            try:
+                timestamp = Time(value, scale="utc") if isinstance(value, str) else value
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{name} is not a valid UTC timestamp.") from exc
+            if not timestamp.isscalar or np.ma.is_masked(timestamp.unix):
+                raise ValueError(f"{name} must be a finite scalar timestamp.")
+            if not np.isfinite(timestamp.unix):
+                raise ValueError(f"{name} must be a finite scalar timestamp.")
+            times.append(timestamp)
+
+        start_time, stop_time = times
+        if start_time > stop_time:
+            raise ValueError("start_time must not be later than stop_time.")
+        edges = Time(
+            self.observed_hist.axes["Time"].edges.to_value("s"),
+            format="unix", scale="utc",
+        )
+        if start_time < edges[0] or stop_time >= edges[-1]:
+            raise ValueError("Timestamps must fall within the observed Time bins.")
+        return start_time, stop_time
 
     @staticmethod
     def _validate_parametric_source(source):

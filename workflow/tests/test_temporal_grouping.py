@@ -1,12 +1,66 @@
 """Checks for grouping physical temporal predictions."""
 
 import astropy.units as u
+from astropy.time import Time
 import numpy as np
 import pytest
 from histpy import Axis, Histogram
 
 from src.residuals import ResidualAnalysis
 from src.time_resolved_residuals_v1 import TemporalPredictionBuilder
+
+
+@pytest.mark.parametrize(
+    "edges,start,stop,expected_edges",
+    [
+        ([0, 3600, 7200, 10800, 14400], 1800, 9000, [0, 3600, 7200, 10800]),
+        ([0, 30, 60, 90, 120], 15, 60, [0, 30, 60, 90]),
+        ([0, 30, 75, 120], 35, 40, [30, 75]),
+        ([0, 30, 75, 120], 0, 119, [0, 30, 75, 120]),
+    ],
+)
+def test_timestamp_selection_uses_native_bins_and_cache(edges, start, stop, expected_edges):
+    """Select complete bins for hourly, sub-minute, and uneven time axes."""
+    time = Axis(edges, label="Time", unit=u.s)
+    phi = Axis([0, 1], label="Phi", unit=u.deg)
+    observed = Histogram([time, phi], contents=np.arange(1, len(edges))[:, None])
+    integrated = Histogram([phi], contents=np.ones(1))
+    builder = TemporalPredictionBuilder(observed, integrated)
+    builder.configure_physical_model(integrated, "unused.h5", None, observed, 1, earth_occ=True)
+    builder._physical_cache = {i: np.array([10.0 + i]) for i in range(len(edges) - 1)}
+
+    selected, expected = builder.timestamps_interval(
+        Time(start, format="unix", scale="utc").isot,
+        Time(stop, format="unix", scale="utc"),
+    )
+
+    np.testing.assert_array_equal(selected.axes["Time"].edges.to_value(u.s), expected_edges)
+    np.testing.assert_array_equal(expected.axes["Time"].edges.to_value(u.s), expected_edges)
+    first_index = edges.index(expected_edges[0])
+    last_index = edges.index(expected_edges[-1])
+    np.testing.assert_array_equal(selected.contents[:, 0], np.arange(first_index + 1, last_index + 1))
+    np.testing.assert_array_equal(expected.contents[:, 0], np.arange(10 + first_index, 10 + last_index))
+
+
+def test_timestamp_selection_rejects_invalid_ranges():
+    """Reject invalid timestamps and the excluded final observation edge."""
+    time = Axis([0, 30, 60], label="Time", unit=u.s)
+    phi = Axis([0, 1], label="Phi", unit=u.deg)
+    observed = Histogram([time, phi], contents=np.ones((2, 1)))
+    builder = TemporalPredictionBuilder(observed, Histogram([phi], contents=np.ones(1)))
+
+    def utc(seconds):
+        return Time(seconds, format="unix", scale="utc")
+
+    for start, stop in ((utc(-1), utc(1)), (utc(1), utc(60)), (utc(31), utc(30))):
+        with pytest.raises(ValueError):
+            builder.timestamps_interval(start, stop)
+    with pytest.raises(ValueError, match="valid UTC timestamp"):
+        builder.timestamps_interval("not a timestamp", utc(1))
+    with pytest.raises(TypeError, match="timestamp string or astropy Time"):
+        builder.timestamps_interval(0, utc(1))
+    with pytest.raises(ValueError, match="scalar"):
+        builder.timestamps_interval(utc([0, 1]), utc(2))
 
 
 @pytest.mark.parametrize("sparse_observed", [False, True])
