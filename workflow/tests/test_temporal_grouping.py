@@ -6,7 +6,7 @@ import pytest
 from histpy import Axis, Histogram
 
 from src.residuals import ResidualAnalysis
-from src.time_resolved_residuals_v1 import TimeResolvedResidualAnalysis
+from src.time_resolved_residuals_v1 import TemporalPredictionBuilder
 
 
 @pytest.mark.parametrize("sparse_observed", [False, True])
@@ -19,9 +19,10 @@ def test_grouping_uses_original_edges_and_cached_counts(sparse_observed):
     if sparse_observed:
         observed = observed.to_sparse()
     integrated = Histogram([phi], contents=np.ones(2))
-    builder = TimeResolvedResidualAnalysis(observed, integrated)
+    builder = TemporalPredictionBuilder(observed, integrated)
     assert builder.observed_hist.is_sparse == sparse_observed
-    builder.configure_physical_model(None, "unused.h5", None, observed, 1, earth_occ=True)
+    # The cached-count fixture does not perform physical image folding.
+    builder.configure_physical_model(integrated, "unused.h5", None, observed, 1, earth_occ=True)
     builder._physical_cache = {i: np.array([i + 1.0, 2.0]) for i in range(4)}
 
     native_d, native_m = builder.build_physical_time_range()
@@ -53,9 +54,9 @@ def test_parametric_dispatch_reuses_bins_and_checks_background(monkeypatch):
     integrated = Histogram([phi], contents=np.array([3.0, 3.0]))
     fitted_background = Histogram([phi], contents=np.array([6.0, 6.0]))
     model = Model(PointSource("source", ra=0, dec=0, spectral_shape=Powerlaw()))
-    builder = TimeResolvedResidualAnalysis(temporal, integrated)
+    builder = TemporalPredictionBuilder(temporal, integrated)
     builder.configure_physical_model(
-        fitted_image=model, response_path="unused", orientation=None,
+        fitted_sky=model, response_path="unused", orientation=None,
         temporal_background=temporal, fitted_background=fitted_background,
         fitted_energy_axis=object(), earth_occ=True,
     )
@@ -66,7 +67,7 @@ def test_parametric_dispatch_reuses_bins_and_checks_background(monkeypatch):
 
     from unittest.mock import MagicMock
     monkeypatch.setattr(FullDetectorResponse, "open", MagicMock())
-    monkeypatch.setattr(builder, "_build_parametric_time_bin", fake_bin)
+    monkeypatch.setattr(builder, "build_parametric_time_bin", fake_bin)
     builder.build_physical_time_range(0, 2)
     _, result = builder.build_physical_time_range(1, 3)
     np.testing.assert_array_equal(result.contents[:, 0], [2, 3])
@@ -78,12 +79,12 @@ def test_parametric_dispatch_reuses_bins_and_checks_background(monkeypatch):
     ))
     with pytest.raises(ValueError, match="Extended sources require"):
         builder.configure_physical_model(
-            fitted_model=extended_model, response_path="unused", orientation=None,
+            fitted_sky=extended_model, response_path="unused", orientation=None,
             temporal_background=temporal, fitted_background=fitted_background,
             fitted_energy_axis=object(), earth_occ=True,
         )
     builder.configure_physical_model(
-        fitted_model=extended_model, response_path="unused", orientation=None,
+        fitted_sky=extended_model, response_path="unused", orientation=None,
         temporal_background=temporal, fitted_background=fitted_background,
         extended_sky_axis=object(), fitted_energy_axis=object(), earth_occ=True,
     )
@@ -91,7 +92,42 @@ def test_parametric_dispatch_reuses_bins_and_checks_background(monkeypatch):
     incompatible = Histogram([phi], contents=np.array([6.0, 7.0]))
     with pytest.raises(ValueError, match="single scaled"):
         builder.configure_physical_model(
-            fitted_model=model, response_path="unused", orientation=None,
+            fitted_sky=model, response_path="unused", orientation=None,
             temporal_background=temporal, fitted_background=incompatible,
             extended_sky_axis=object(), fitted_energy_axis=object(), earth_occ=True,
         )
+
+
+def test_fitted_sky_selects_imaging_and_rejects_unsupported_inputs(monkeypatch):
+    """Check configuration and dispatch with a mock, not a physical prediction."""
+    from unittest.mock import MagicMock
+    from cosipy.response import FullDetectorResponse
+
+    time = Axis([0, 1], label="Time", unit=u.s)
+    phi = Axis([0, 1, 2], label="Phi", unit=u.deg)
+    temporal = Histogram([time, phi], contents=np.ones((1, 2)))
+    integrated = Histogram([phi], contents=np.ones(2))
+    builder = TemporalPredictionBuilder(temporal, integrated)
+
+    # This histogram is a dispatch fixture, not a fitted sky image.
+    builder.configure_physical_model(
+        fitted_sky=integrated, response_path="unused", orientation=None,
+        temporal_background=temporal, background_normalization=1.0, earth_occ=True,
+    )
+    assert builder._physical_configuration["fitted_image"] is integrated
+    assert "fitted_model" not in builder._physical_configuration
+
+    calls = []
+    def fake_imaging_bin(time_bin_index, **kwargs):
+        calls.append(time_bin_index)
+        assert kwargs["fitted_image"] is integrated
+        return {"total": Histogram([phi], contents=np.array([2.0, 3.0]))}
+
+    monkeypatch.setattr(FullDetectorResponse, "open", MagicMock())
+    monkeypatch.setattr(builder, "build_imaging_time_bin", fake_imaging_bin)
+    _, expected = builder.build_physical_time_range()
+    assert calls == [0]
+    np.testing.assert_array_equal(expected.contents, [[2.0, 3.0]])
+
+    with pytest.raises(TypeError, match="Histogram or an astromodels Model"):
+        builder.configure_physical_model(fitted_sky=object(), earth_occ=True)

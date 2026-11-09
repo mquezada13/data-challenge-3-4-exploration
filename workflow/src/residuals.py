@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 from histpy import Axis, Histogram
 import astropy.units as u
-from .time_resolved_residuals_v1 import TimeResolvedResidualAnalysis
+from .time_resolved_residuals_v1 import TemporalPredictionBuilder
 from .residual_statistics import build_pearson_references, residual_statistics
 
 class ResidualAnalysis:
@@ -46,7 +46,7 @@ class ResidualAnalysis:
                 )
             print("Observed data contain time information; using temporal residual analysis.")
             cds_labels = tuple(str(label) for label in expected.axes.labels if label != "Time")
-            self._time_analysis = TimeResolvedResidualAnalysis(
+            self._time_analysis = TemporalPredictionBuilder(
                 observed=observed,
                 integrated_expected=expected.project(*cds_labels),
             )
