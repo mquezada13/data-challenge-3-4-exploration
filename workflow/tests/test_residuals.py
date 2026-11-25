@@ -1,6 +1,7 @@
 """Numerical tests for COSI residual analysis."""
 
 import numpy as np
+import healpy as hp
 import pytest
 import matplotlib
 matplotlib.use("Agg")
@@ -97,8 +98,8 @@ def test_mask_excludes_only_numerical_floor_bins_without_events():
     assert analysis.mask_report["observed_counts_excluded"] == 0.0
 
 
-def test_configured_expected_floor_excludes_empty_bins_and_rejects_events():
-    """A configured artificial floor is masked only for empty bins."""
+def test_configured_expected_floor_excludes_empty_bins_and_retains_events():
+    """A configured floor excludes empty bins but retains observed events."""
     expected_floor = 1e-12
     expected = make_histogram([2.0, expected_floor])
 
@@ -113,14 +114,13 @@ def test_configured_expected_floor_excludes_empty_bins_and_rejects_events():
     assert analysis.mask_report["excluded_bins"] == 1
     assert analysis.mask_report["expected_floor"] == expected_floor
 
-    # A floor bin containing observed events must raise instead of hiding data.
+    # A floor bin containing observed events is retained and reported.
     observed_with_floor_events = make_histogram([3.0, 1.0])
-    with pytest.raises(ValueError, match="contain observed events"):
-        ResidualAnalysis(
-            observed_with_floor_events,
-            expected,
-            expected_floor=expected_floor,
-        )
+    analysis = ResidualAnalysis(observed_with_floor_events, expected, expected_floor=expected_floor)
+    np.testing.assert_array_equal(analysis.mask, [True, True])
+    assert analysis.mask_report["occupied_floor_bins"] == 1
+    assert analysis.mask_report["observed_counts_at_floor"] == 1.0
+    assert analysis.mask_report["observed_counts_excluded"] == 0.0
 
 
 def test_pearson_poisson_reference_is_reproducible():
@@ -320,11 +320,12 @@ def test_pearson_plot_uses_the_same_histogram_edges_for_observed_and_reference(
         random_seed=7,
     )
     distribution_axis = figure.axes[-1]
-    observed_bars = distribution_axis.containers[0].patches
-    observed_edges = np.array(
-        [observed_bars[0].get_x()]
-        + [bar.get_x() + bar.get_width() for bar in observed_bars]
+    observed_step = next(
+        patch
+        for patch in distribution_axis.patches
+        if patch.get_label() == "Observed Pearson residuals"
     )
+    observed_edges = np.unique(observed_step.get_xy()[:, 0])   # outline histogram: x of its vertices
     simulated_step = next(
         patch
         for patch in distribution_axis.patches
@@ -383,13 +384,55 @@ def test_constructor_phi_slice_does_not_affect_integrated_psichi_plot(monkeypatc
     assert result is None
 
 
-def test_mask_rejects_observed_events_with_zero_expectation():
-    """Observed events cannot be silently masked when expectation is zero."""
+def test_mask_retains_observed_events_with_zero_expectation():
+    """Observed events are retained and their normalized residual is undefined."""
     observed = make_histogram([0.0, 1.0])
     expected = make_histogram([2.0, 0.0])
 
-    with pytest.raises(ValueError, match="contain observed events"):
-        ResidualAnalysis(observed, expected)
+    analysis = ResidualAnalysis(observed, expected)
+    analysis._projected_data_cache = {"Phi_projection": analysis.projection_function("Phi")}
+    np.testing.assert_array_equal(analysis.mask, [True, True])
+    assert analysis.mask_report["observed_counts_at_floor"] == 1.0
+    assert np.isnan(analysis.residual_function("Phi_projection", "pearson").contents[1])
+    assert analysis.residual_function("Phi_projection", "raw").contents[1] == 1.0
+    with pytest.raises(ValueError, match="Normalized full-CDS"):
+        analysis.statistics_table("pearson")
+
+
+def test_projection_retains_floor_events_with_supported_expectation():
+    """Floor events contribute after projection when other bins support the model."""
+    axes = [Axis([0, 1, 2], label="Phi", unit=u.deg), Axis([0, 1, 2], label="Other")]
+    observed = Histogram(axes, contents=np.array([[1., 4.], [2., 0.]]))
+    expected = Histogram(axes, contents=np.array([[0., 3.], [0., 0.]]))
+    analysis = ResidualAnalysis(observed, expected)
+    analysis._projected_data_cache = {"Phi_projection": analysis.projection_function("Phi")}
+    raw = analysis.residual_function("Phi_projection", "raw").contents
+    pearson = analysis.residual_function("Phi_projection", "pearson").contents
+    np.testing.assert_allclose(raw, [2., 2.])
+    assert pearson[0] == pytest.approx(2. / np.sqrt(3.))
+    assert np.isnan(pearson[1])
+
+
+def test_energy_selection_preserves_floor_only_provenance():
+    """Summing floor-only bins must not turn them into model support."""
+    axes = [
+        Axis([100, 200, 300], label="Em", unit=u.keV),
+        Axis([0, 1], label="Phi", unit=u.deg),
+        HealpixAxis(nside=1, scheme="RING", coordsys="galactic", label="PsiChi"),
+    ]
+    observed_values = np.zeros((2, 1, 12))
+    expected_values = np.zeros((2, 1, 12))
+    observed_values[:, 0, 0] = 1.0
+    expected_values[:, 0, 0] = 1e-12
+    expected_values[:, 0, 1] = 1.0
+    analysis = ResidualAnalysis(
+        Histogram(axes, contents=observed_values),
+        Histogram(axes, contents=expected_values),
+        expected_floor=1e-12,
+    )
+    selected = analysis.select_energy_range(100, 300)
+    assert selected.mask_report["observed_counts_at_floor"] == 2.0
+    assert np.isnan(selected.residual_function("PsiChi_projection", "pearson").contents[0])
 
 
 def test_mask_rejects_histograms_with_no_valid_bins():
@@ -964,236 +1007,120 @@ def test_psichi_coordinate_split_requires_positive_bin_width():
             {"observed": histogram, "expected": histogram.copy()},
             bin_width=0.0,
         )
-def test_time_residual_selects_and_normalizes_requested_interval():
-    """Select one Time bin and normalize the integrated model to its counts."""
+def make_prepared_temporal_analysis():
+    """Create a small prepared physical pair with unequal interval totals."""
     time_axis = Axis([0.0, 10.0, 20.0], label="Time", unit=u.s)
     phi_axis = Axis([0.0, 1.0, 2.0], label="Phi", unit=u.deg)
-
-    # The Time projection reproduces the integrated observed counts [5, 5].
-    time_binned_observed = Histogram(
-        [time_axis, phi_axis],
-        contents=np.array(
-            [
-                [2.0, 4.0],
-                [3.0, 1.0],
-            ]
-        ),
-    )
-
-    integrated_observed = Histogram(
-        [phi_axis],
-        contents=np.array([5.0, 5.0]),
-    )
-    integrated_expected = Histogram(
-        [phi_axis],
-        contents=np.array([3.0, 7.0]),
-    )
-
-    temporal_analysis = ResidualAnalysis(
-        observed=integrated_observed,
-        expected=integrated_expected,
-        time_residual=True,
-        time_binned_observed=time_binned_observed,
-    )
-    analysis = temporal_analysis.select_time_bin(1)
-
-    assert tuple(temporal_analysis.observed_hist.axes.labels) == (
-        "Time",
-        "Phi",
-    )
-    assert temporal_analysis.time_bin_index is None
-
-    np.testing.assert_array_equal(
-        analysis.observed_hist.contents,
-        [3.0, 1.0],
-    )
-    np.testing.assert_allclose(
-        analysis.expected_hist.contents,
-        [1.2, 2.8],
-    )
-
-    assert tuple(analysis.observed_hist.axes.labels) == ("Phi",)
-    assert analysis.time_bin_index == 1
-    assert analysis.time_start == 10.0 * u.s
-    assert analysis.time_stop == 20.0 * u.s
+    observed = Histogram([time_axis, phi_axis], contents=np.array([[2.0, 4.0], [3.0, 1.0]]))
+    expected = Histogram([time_axis, phi_axis], contents=np.array([[1.5, 3.5], [2.0, 3.0]]))
+    return ResidualAnalysis(observed=observed, expected=expected)
 
 
-def test_residual_analysis_selects_cached_time_intervals():
-    """Reuse complete temporal products through the public residual API."""
-    time_axis = Axis([0.0, 10.0, 20.0], label="Time", unit=u.s)
-    phi_axis = Axis([0.0, 1.0, 2.0], label="Phi", unit=u.deg)
-    time_binned_observed = Histogram(
-        [time_axis, phi_axis],
-        contents=np.array(
-            [
-                [2.0, 4.0],
-                [3.0, 1.0],
-            ]
-        ),
-    )
-    integrated_observed = Histogram(
-        [phi_axis],
-        contents=np.array([5.0, 5.0]),
-    )
-    integrated_expected = Histogram(
-        [phi_axis],
-        contents=np.array([3.0, 7.0]),
-    )
-    time_analysis = ResidualAnalysis(
-        observed=integrated_observed,
-        expected=integrated_expected,
-        time_residual=True,
-        time_binned_observed=time_binned_observed,
-    )
+def test_time_residual_selects_prepared_interval_without_normalization():
+    """Select matching observed and physical expected counts unchanged."""
+    temporal = make_prepared_temporal_analysis()
+    selected = temporal.select_time_bin(1)
 
-    first_selection = time_analysis.select_time_bin(0)
-    observed_product = time_analysis._time_analysis.observed_hist
-    expected_product = time_analysis._time_analysis.expected_hist
-    second_selection = time_analysis.select_time_bin(1)
+    assert tuple(temporal.observed_hist.axes.labels) == ("Time", "Phi")
+    assert temporal.time_bin_index is None
+    np.testing.assert_array_equal(selected.observed_hist.contents, [3.0, 1.0])
+    np.testing.assert_array_equal(selected.expected_hist.contents, [2.0, 3.0])
+    assert selected.expected_hist.contents.sum() != selected.observed_hist.contents.sum()
+    assert tuple(selected.observed_hist.axes.labels) == ("Phi",)
+    assert selected.time_bin_index == 1
+    assert selected.time_start == 10.0 * u.s
+    assert selected.time_stop == 20.0 * u.s
 
-    assert time_analysis._time_analysis.observed_hist is observed_product
-    assert time_analysis._time_analysis.expected_hist is expected_product
-    np.testing.assert_array_equal(
-        first_selection.observed_hist.contents,
-        [2.0, 4.0],
-    )
-    np.testing.assert_allclose(
-        first_selection.expected_hist.contents,
-        [1.8, 4.2],
-    )
-    np.testing.assert_array_equal(
-        second_selection.observed_hist.contents,
-        [3.0, 1.0],
-    )
-    np.testing.assert_allclose(
-        second_selection.expected_hist.contents,
-        [1.2, 2.8],
-    )
-    assert second_selection.time_bin_index == 1
-    assert second_selection.time_start == 10.0 * u.s
-    assert second_selection.time_stop == 20.0 * u.s
-    assert second_selection._temporal_total_counts == 4
-    np.testing.assert_allclose(
-        second_selection._temporal_reference_probabilities,
-        [0.3, 0.7],
-    )
 
-    second_selection._projected_data_cache = {
-        "Phi_projection": second_selection.projection_function("Phi")
-    }
-    figure = PlottingResiduals(second_selection).plot(
-        "Phi_projection",
-        residual_type="raw",
+def test_residual_analysis_selects_prepared_time_intervals():
+    """Select multiple intervals without rebuilding or changing the pair."""
+    temporal = make_prepared_temporal_analysis()
+    original_observed = temporal.observed_hist.contents.copy()
+    original_expected = temporal.expected_hist.contents.copy()
+    first = temporal.select_time_bin(0)
+    second = temporal.select_time_bin(1)
+
+    np.testing.assert_array_equal(first.observed_hist.contents, [2.0, 4.0])
+    np.testing.assert_array_equal(first.expected_hist.contents, [1.5, 3.5])
+    np.testing.assert_array_equal(second.observed_hist.contents, [3.0, 1.0])
+    np.testing.assert_array_equal(second.expected_hist.contents, [2.0, 3.0])
+    np.testing.assert_array_equal(temporal.observed_hist.contents, original_observed)
+    np.testing.assert_array_equal(temporal.expected_hist.contents, original_expected)
+    assert second._temporal_reference_probabilities is None
+
+    second._projected_data_cache = {"Phi_projection": second.projection_function("Phi")}
+    figure = PlottingResiduals(second).plot(
+        "Phi_projection", residual_type="raw", show_uncertainty=True,
     )
     assert "Time bin 1" in figure.axes[0].get_title()
-    legend_labels = [
-        text.get_text()
-        for text in figure.axes[0].get_legend().get_texts()
-    ]
-    assert r"Multinomial uncertainty ($\pm 1\sigma$)" in legend_labels
+    labels = [text.get_text() for text in figure.axes[0].get_legend().get_texts()]
+    assert r"Poisson uncertainty ($\pm 1\sigma$)" in labels
     plt.close(figure)
 
 
 def test_residual_analysis_rejects_invalid_time_selection_indices():
     """Reject boolean, negative, and out-of-range Time-bin indices."""
-    time_axis = Axis([0.0, 10.0, 20.0], label="Time", unit=u.s)
-    phi_axis = Axis([0.0, 1.0, 2.0], label="Phi", unit=u.deg)
-    time_binned_observed = Histogram(
-        [time_axis, phi_axis],
-        contents=np.ones((2, 2)),
-    )
-    integrated = Histogram(
-        [phi_axis],
-        contents=np.array([2.0, 2.0]),
-    )
-    time_analysis = ResidualAnalysis(
-        observed=integrated,
-        expected=integrated.copy(),
-        time_residual=True,
-        time_binned_observed=time_binned_observed,
-    )
-
+    temporal = make_prepared_temporal_analysis()
     with pytest.raises(TypeError, match="must be an integer"):
-        time_analysis.select_time_bin(True)
+        temporal.select_time_bin(True)
     with pytest.raises(ValueError, match="must be non-negative"):
-        time_analysis.select_time_bin(-1)
+        temporal.select_time_bin(-1)
     with pytest.raises(IndexError, match="outside the available Time bins"):
-        time_analysis.select_time_bin(2)
+        temporal.select_time_bin(2)
 
-def test_time_residual_requires_temporal_inputs():
-    """Require time-binned data and explicit selection before projections."""
+
+def test_time_residual_requires_matching_temporal_inputs():
+    """Require matching temporal histograms for a physical residual analysis."""
     histogram = make_histogram([2.0, 3.0])
-
-    with pytest.raises(
-        ValueError,
-        match="time_binned_observed is required",
-    ):
-        ResidualAnalysis(
-            observed=histogram,
-            expected=histogram.copy(),
-            time_residual=True,
-        )
-
-    with pytest.raises(
-        ValueError,
-        match="available only when time_residual=True",
-    ):
-        ResidualAnalysis(
-            observed=histogram,
-            expected=histogram.copy(),
-        ).select_time_bin(0)
-
     time_axis = Axis([0.0, 10.0], label="Time", unit=u.s)
-    time_binned_observed = Histogram(
-        [time_axis, histogram.axes[0]],
-        contents=np.array([[2.0, 3.0]]),
-    )
-    temporal_analysis = ResidualAnalysis(
-        observed=histogram,
-        expected=histogram.copy(),
-        time_residual=True,
-        time_binned_observed=time_binned_observed,
-    )
-    with pytest.raises(ValueError, match="Select a Time bin"):
-        temporal_analysis.residual_function("Phi_projection")
+    temporal = Histogram([time_axis, histogram.axes[0]], contents=np.array([[2.0, 3.0]]))
+    with pytest.raises(ValueError, match="prepared physical expected"):
+        ResidualAnalysis(observed=temporal, expected=histogram)
+    with pytest.raises(ValueError, match="matching Time and CDS axes"):
+        different_time = Axis([0.0, 20.0], label="Time", unit=u.s)
+        mismatched = Histogram([different_time, histogram.axes[0]], contents=np.array([[2.0, 3.0]]))
+        ResidualAnalysis(observed=temporal, expected=mismatched)
+    with pytest.raises(ValueError, match="observed data contain a Time axis"):
+        ResidualAnalysis(observed=histogram, expected=histogram.copy()).select_time_bin(0)
 
 
 def test_temporal_1d_plot_labels_model_and_utc_interval():
-    """Temporal count plots identify D(t,i), M_tilde(t,i), and UTC bounds."""
+    """Temporal count plots identify physical expected counts and UTC bounds."""
     analysis = make_poisson_reference_analysis(
-        expected_values=[3.0, 4.0, 5.0],
-        observed_values=[2.0, 5.0, 5.0],
+        expected_values=[3.0, 4.0, 5.0], observed_values=[2.0, 5.0, 5.0],
     )
     analysis.time_bin_index = 5
     analysis.time_start = 3600.0 * u.s
     analysis.time_stop = 7200.0 * u.s
-    analysis._temporal_total_counts = 12
-    analysis._temporal_reference_probabilities = np.array(
-        [0.25, 1.0 / 3.0, 5.0 / 12.0]
-    )
-
     figure = PlottingResiduals(analysis).plot(
-        "Phi_projection",
-        residual_type="raw",
+        "Phi_projection", residual_type="raw", show_uncertainty=True,
     )
-
-    counts_axis = figure.axes[0]
-    title = counts_axis.get_title()
-    legend_labels = [
-        text.get_text()
-        for text in counts_axis.get_legend().get_texts()
-    ]
-
+    title = figure.axes[0].get_title()
+    labels = [text.get_text() for text in figure.axes[0].get_legend().get_texts()]
     assert "Time bin 5" in title
-    assert "1970-01-01 01:00:00–1970-01-01 02:00:00 UTC" in title
-    assert r"Observed $D_{t,i}$" in legend_labels
-    assert r"Normalized model $\widetilde{M}_{t,i}$" in legend_labels
-    assert r"Multinomial uncertainty ($\pm 1\sigma$)" in legend_labels
+    assert "1970-01-01 01:00:00-1970-01-01 02:00:00 UTC" in title
+    assert r"Observed $D_{t,i}$" in labels
+    assert r"Physical model $M_{t,i}$" in labels
+    assert r"Poisson uncertainty ($\pm 1\sigma$)" in labels
     plt.close(figure)
 
 
-def test_pearson_plot_uses_limegreen_sigma_guides():
-    """Pearson plots use a three-sigma band and distinct inner guide lines."""
+def test_pearson_plot_expands_limits_to_include_residuals():
+    """Both positive and negative outliers remain visible on the residual axis."""
+    analysis = make_poisson_reference_analysis(
+        expected_values=[100.0, 1.0], observed_values=[0.0, 21.0],
+    )
+    figure = PlottingResiduals(analysis).plot(
+        "Phi_projection", residual_type="pearson", show_gaussian_reference=False,
+    )
+    lower, upper = figure.axes[1].get_ylim()
+    assert lower < -10.0
+    assert upper > 20.0
+    plt.close(figure)
+
+
+def test_pearson_plot_omits_statistical_guides_by_default():
+    """Default Pearson plots show residuals without uncalibrated references."""
     analysis = make_poisson_reference_analysis(
         expected_values=[3.0, 4.0, 5.0],
         observed_values=[2.0, 5.0, 5.0],
@@ -1202,126 +1129,114 @@ def test_pearson_plot_uses_limegreen_sigma_guides():
     figure = PlottingResiduals(analysis).plot(
         "Phi_projection",
         residual_type="pearson",
-        n_simulations=4,
-        random_seed=17,
     )
     residual_axis = figure.axes[1]
-
-    sigma_band = next(
-        patch
-        for patch in residual_axis.patches
-        if patch.get_label() == r"$\pm3\sigma$ range"
-    )
-    np.testing.assert_allclose(
-        sigma_band.get_facecolor(),
-        matplotlib.colors.to_rgba("limegreen", alpha=0.15),
-    )
+    assert not residual_axis.patches
     assert residual_axis.get_ylim() == (-5.0, 5.0)
-
-    labeled_lines = {
-        line.get_label(): line
-        for line in residual_axis.lines
-    }
-    assert labeled_lines[r"$\pm1\sigma$"].get_color() == "limegreen"
-    assert labeled_lines[r"$\pm1\sigma$"].get_linestyle() == ":"
-    assert labeled_lines[r"$\pm2\sigma$"].get_color() == "limegreen"
-    assert labeled_lines[r"$\pm2\sigma$"].get_linestyle() == "--"
     counts_legend_labels = [
         text.get_text()
         for text in figure.axes[0].get_legend().get_texts()
     ]
-    assert r"Poisson uncertainty ($\pm 1\sigma$)" in counts_legend_labels
+    assert r"Poisson uncertainty ($\pm 1\sigma$)" not in counts_legend_labels
+    distribution_labels = [line.get_label() for line in figure.axes[2].lines]
+    assert r"Standard normal $N(0,1)$" not in distribution_labels
     plt.close(figure)
 
 
-def test_temporal_reference_uses_fixed_total_multinomial_after_energy_selection(
-    monkeypatch,
-):
-    """Temporal MC keeps full N(t) and the probability outside an Em range."""
-    time_axis = Axis([0.0, 10.0, 20.0], label="Time", unit=u.s)
-    em_axis = Axis([100.0, 200.0, 300.0], label="Em", unit=u.keV)
-    phi_axis = Axis([0.0, 1.0, 2.0], label="Phi", unit=u.deg)
-
-    time_binned_observed = Histogram(
-        [time_axis, em_axis, phi_axis],
-        contents=np.array(
-            [
-                [[1.0, 1.0], [2.0, 2.0]],
-                [[1.0, 3.0], [2.0, 4.0]],
-            ]
-        ),
-    )
-    integrated_observed = Histogram(
-        [em_axis, phi_axis],
-        contents=np.array([[2.0, 4.0], [4.0, 6.0]]),
-    )
-    integrated_expected = Histogram(
-        [em_axis, phi_axis],
-        contents=np.array([[1.0, 2.0], [3.0, 4.0]]),
-    )
-
-    temporal_container = ResidualAnalysis(
-        observed=integrated_observed,
-        expected=integrated_expected,
-        time_residual=True,
-        time_binned_observed=time_binned_observed,
-    )
-    temporal_analysis = temporal_container.select_time_bin(1)
-    selected_analysis = temporal_analysis.select_energy_range(100.0, 200.0)
-    selected_analysis._projected_data_cache = {
-        "Phi_projection": selected_analysis.projection_function("Phi")
-    }
-
+def test_temporal_physical_reference_uses_poisson_after_energy_selection(monkeypatch):
+    """Use the selected physical expectations for fixed-fit Poisson draws."""
+    time = Axis([0.0, 10.0, 20.0], label="Time", unit=u.s)
+    em = Axis([100.0, 200.0, 300.0], label="Em", unit=u.keV)
+    phi = Axis([0.0, 1.0, 2.0], label="Phi", unit=u.deg)
+    observed = Histogram([time, em, phi], contents=np.array([
+        [[1.0, 1.0], [2.0, 2.0]], [[1.0, 3.0], [2.0, 4.0]],
+    ]))
+    expected = Histogram([time, em, phi], contents=np.array([
+        [[2.0, 2.0], [3.0, 3.0]], [[1.0, 2.0], [3.0, 4.0]],
+    ]))
+    selected = ResidualAnalysis(observed, expected).select_time_bin(1).select_energy_range(100.0, 200.0)
+    selected._projected_data_cache = {"Phi_projection": selected.projection_function("Phi")}
     original_default_rng = np.random.default_rng
-    multinomial_calls = []
+    poisson_calls = []
 
     class CountingGenerator:
-        """Record multinomial inputs while retaining NumPy draws."""
-
+        """Record the Poisson expectations while retaining NumPy draws."""
         def __init__(self, seed):
             self.generator = original_default_rng(seed)
 
-        def multinomial(self, total, probabilities):
-            multinomial_calls.append(
-                (total, np.asarray(probabilities).copy())
-            )
-            return self.generator.multinomial(total, probabilities)
-
         def poisson(self, expected_counts):
-            raise AssertionError(
-                "Temporal references must not use Poisson draws."
-            )
+            poisson_calls.append(np.asarray(expected_counts).copy())
+            return self.generator.poisson(expected_counts)
 
-    monkeypatch.setattr(
-        np.random,
-        "default_rng",
-        lambda seed=None: CountingGenerator(seed),
-    )
+        def multinomial(self, *args):
+            raise AssertionError("Physical references must use Poisson draws.")
 
-    selected_analysis.pearson_poisson_reference(
-        "Phi_projection",
-        n_simulations=4,
-        bins=5,
-        seed=17,
-    )
+    monkeypatch.setattr(np.random, "default_rng", lambda seed=None: CountingGenerator(seed))
+    selected.pearson_poisson_reference("Phi_projection", n_simulations=4, bins=5, seed=17)
+    assert len(poisson_calls) == 4
+    for values in poisson_calls:
+        np.testing.assert_array_equal(values, [[1.0, 2.0]])
 
-    assert len(multinomial_calls) == 4
-    for total, probabilities in multinomial_calls:
-        assert total == 10
-        np.testing.assert_allclose(probabilities, [0.1, 0.2, 0.7])
-
-    plotter = PlottingResiduals(
-        selected_analysis,
-        n_simulations=4,
-        random_seed=17,
+    figure = PlottingResiduals(selected, n_simulations=4, random_seed=17).plot(
+        "Phi_projection", residual_type="pearson",
     )
-    figure = plotter.plot(
-        "Phi_projection",
-        residual_type="pearson",
-    )
-    distribution_labels = [
-        text.get_text()
-        for text in figure.axes[2].get_legend().get_texts()
-    ]
-    assert "Multinomial MC mean density" in distribution_labels
+    labels = [text.get_text() for text in figure.axes[2].get_legend().get_texts()]
+    assert "Poisson MC mean density" in labels
     plt.close(figure)
+
+
+def test_plot_show_false_returns_figure_without_showing(monkeypatch):
+    """With show=False the figure is returned and plt.show is not called."""
+    calls = []
+    monkeypatch.setattr(plt, "show", lambda: calls.append(1))
+    analysis = make_poisson_reference_analysis(np.full(6, 4.0))
+    plotting = PlottingResiduals(analysis)
+    figure = plotting.plot("Phi_projection", residual_type="raw", show=False)
+    assert calls == []
+    plt.close(figure)
+    figure = plotting.plot("Phi_projection", residual_type="raw")
+    assert calls == [1]
+    plt.close(figure)
+
+
+def test_plot_label_is_written_above_the_figure(monkeypatch):
+    """The label becomes the figure title."""
+    monkeypatch.setattr(plt, "show", lambda: None)
+    analysis = make_poisson_reference_analysis(np.full(6, 4.0))
+    figure = PlottingResiduals(analysis).plot(
+        "Phi_projection", residual_type="raw", label="NF fit",
+    )
+    assert figure._suptitle.get_text() == "NF fit"
+    plt.close(figure)
+
+
+@pytest.mark.parametrize("scheme", ["RING", "NESTED"])
+def test_degrade_psichi_sums_fine_pixels_into_coarse_pixels(scheme):
+    """Coarse pixels hold the sum of their fine pixels; totals are conserved."""
+    fine_nside, coarse_nside = 4, 2
+    phi_axis = Axis([0.0, 1.0, 2.0], label="Phi", unit=u.deg)
+    fine_axis = HealpixAxis(nside=fine_nside, scheme=scheme, coordsys="galactic", label="PsiChi")
+    rng = np.random.default_rng(3)
+    expected_values = rng.uniform(1.0, 5.0, size=(2, fine_axis.npix))
+    observed_values = rng.poisson(expected_values).astype(float)
+    analysis = ResidualAnalysis(
+        Histogram([phi_axis, fine_axis], contents=observed_values),
+        Histogram([phi_axis, fine_axis], contents=expected_values),
+    )
+    coarse = analysis.degrade_psichi(coarse_nside)
+    coarse_axis = coarse.observed_hist.axes["PsiChi"]
+    assert coarse_axis.nside == coarse_nside and coarse_axis.scheme == scheme
+
+    # Reference: healpy ud_grade with power=-2 sums the fine pixels
+    nest = scheme == "NESTED"
+    for values, histogram in ((observed_values, coarse.observed_hist),
+                              (expected_values, coarse.expected_hist)):
+        reference = np.array([
+            hp.ud_grade(row, coarse_nside, power=-2, order_in=scheme, order_out=scheme)
+            for row in values
+        ])
+        np.testing.assert_allclose(histogram.contents, reference)
+        np.testing.assert_allclose(histogram.contents.sum(), values.sum())
+
+    with pytest.raises(ValueError):
+        analysis.degrade_psichi(3)

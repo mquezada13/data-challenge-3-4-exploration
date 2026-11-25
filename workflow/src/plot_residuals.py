@@ -2,6 +2,7 @@
 
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 from matplotlib.figure import Figure
 from matplotlib.colors import TwoSlopeNorm
 from scipy import stats
@@ -19,6 +20,7 @@ class PlottingResiduals:
     """
 
     _PEARSON_REFERENCE_BINS = {
+        "Time_projection": 15,
         "Em_projection": 15,
         "Em_Phi_projection": 40,
         "Em_Chi_projection": 40,
@@ -40,6 +42,7 @@ class PlottingResiduals:
         random_seed: int | None = None,
         phi_bin_index: int | None = None,
         energy_bin_index: int | None = None,
+        color: str = "tab:blue",
     ) -> None:
         """Store the analysis and optional Pearson simulation settings.
 
@@ -55,8 +58,10 @@ class PlottingResiduals:
                 references and used by ``Phi_PsiChi_projection`` by default.
             energy_bin_index: Optional Em slice used by
                 ``Em_PsiChi_projection`` by default.
+            color: Colour of the residual distributions, drawn as outlines.
         """
         self.analysis = analysis
+        self.color = color
         self.n_simulations = n_simulations
         self.random_seed = random_seed
         self.phi_bin_index = phi_bin_index
@@ -71,7 +76,7 @@ class PlottingResiduals:
             return ""
 
         energy_edges = observed_hist.axes["Em"].edges.to_value(u.keV)
-        return f" — {energy_edges[0]:g}–{energy_edges[-1]:g} keV"
+        return f" - {energy_edges[0]:g}-{energy_edges[-1]:g} keV"
 
     def _format_time_interval_suffix(self) -> str:
         """Format the selected time-bin boundaries for plot titles."""
@@ -101,17 +106,19 @@ class PlottingResiduals:
 
         return (
             f"\nTime bin {time_bin_index}: "
-            f"{start_label}–{stop_label} UTC"
+            f"{start_label}-{stop_label} UTC"
         )
 
     def _count_legend_labels(self) -> tuple[str, str]:
         """Return count-plot labels for integrated or temporal analyses."""
+        if getattr(self.analysis, "_time_analysis", None) is not None:
+            return r"Observed $D_t$", r"Physical model $M_t$"
         if getattr(self.analysis, "time_bin_index", None) is None:
             return "Observed", "Fitted expectation"
 
         return (
             r"Observed $D_{t,i}$",
-            r"Normalized model $\widetilde{M}_{t,i}$",
+            r"Physical model $M_{t,i}$",
         )
 
     def _monte_carlo_mean_label(self) -> str:
@@ -191,6 +198,35 @@ class PlottingResiduals:
     def plot(
         self,
         projection_id: str,
+        *args,
+        label: str | None = None,
+        show: bool = True,
+        **kwargs,
+    ) -> Figure:
+        """Create, optionally label, and show a residual figure.
+
+        Takes the same arguments as ``_plot_figure``, plus:
+
+        Args:
+            label: Optional title above the whole figure, for example the name
+                of the fit.
+            show: Display the figure (default). With ``False`` the figure is
+                only returned, so several figures can be arranged together.
+
+        Returns:
+            The Matplotlib figure containing the requested diagnostic.
+        """
+        figure = self._plot_figure(projection_id, *args, **kwargs)
+        if label is not None:
+            figure.suptitle(label)
+            figure.tight_layout()
+        if show:
+            plt.show()
+        return figure
+
+    def _plot_figure(
+        self,
+        projection_id: str,
         residual_type: str = "raw",
         phi_bin_index: int | None = None,
         running_mean_window: int | None = None,
@@ -198,6 +234,7 @@ class PlottingResiduals:
         random_seed: int | None = None,
         show_gaussian_reference: bool | None = None,
         energy_bin_index: int | None = None,
+        show_uncertainty: bool | None = None,
     ) -> Figure:
         """Create a residual figure for a selected projection.
 
@@ -219,10 +256,11 @@ class PlottingResiduals:
                 If omitted, the constructor setting is used. When simulations
                 are enabled without a seed, one seed is generated and reused.
             show_gaussian_reference: Whether to overlay the theoretical
-                standard normal curve. By default it is shown without
-                simulations and hidden when simulations are requested.
+                standard normal curve. Disabled by default.
             energy_bin_index: Em-bin index for a slice of
                 ``"Em_PsiChi_projection"``.
+            show_uncertainty: Show the existing nominal count uncertainty band.
+                Disabled by default.
 
         Returns:
             The Matplotlib figure containing the requested diagnostic.
@@ -291,7 +329,7 @@ class PlottingResiduals:
                 )
 
         if show_gaussian_reference is None:
-            show_gaussian = residual_type == "pearson" and plot_n_simulations is None
+            show_gaussian = False
         else:
             show_gaussian = show_gaussian_reference
 
@@ -350,6 +388,7 @@ class PlottingResiduals:
 
         # Route supported one-dimensional projections to their plotter.
         one_dimensional_ids = {
+            "Time_projection",
             "Em_projection",
             "Phi_projection",
             "Chi_projection",
@@ -378,6 +417,7 @@ class PlottingResiduals:
             plot_n_simulations,
             plot_random_seed,
             show_gaussian,
+            show_uncertainty,
         )
 
     #---------------------------------------------------------------------------
@@ -394,6 +434,7 @@ class PlottingResiduals:
         n_simulations: int | None = None,
         random_seed: int | None = None,
         show_gaussian_reference: bool = True,
+        show_uncertainty: bool | None = None,
     ) -> Figure:
         """Plot observed and expected counts with one-dimensional residuals.
 
@@ -418,6 +459,14 @@ class PlottingResiduals:
         x_values = axis.centers.to_value(axis_unit)
         # Use the true bin boundaries for step plots.
         bin_edges = axis.edges.to_value(axis_unit)
+        if axis_name == "Time":
+            # Convert the actual Unix-time boundaries and centers to UTC dates.
+            bin_edges = mdates.date2num(
+                Time(axis.edges.to_value(u.s), format="unix", scale="utc").datetime
+            )
+            x_values = mdates.date2num(
+                Time(axis.centers.to_value(u.s), format="unix", scale="utc").datetime
+            )
 
         # Get the counts and residual values from the input histograms.
         observed_values = observed_hist.contents
@@ -463,6 +512,8 @@ class PlottingResiduals:
             "_temporal_total_counts",
             None,
         )
+        if show_uncertainty is None:
+            show_uncertainty = False
         if temporal_total is None:
             count_sigma = np.sqrt(expected_values)
             uncertainty_label = r"Poisson uncertainty ($\pm 1\sigma$)"
@@ -476,15 +527,16 @@ class PlottingResiduals:
             uncertainty_label = r"Multinomial uncertainty ($\pm 1\sigma$)"
 
         # Draw the uncertainty band using the true histogram boundaries.
-        counts_axis.stairs(
-            expected_values + count_sigma,
-            bin_edges,
-            baseline=expected_values - count_sigma,
-            fill=True,
-            color="tab:orange",
-            alpha=0.3,
-            label=uncertainty_label,
-        )
+        if show_uncertainty:
+            counts_axis.stairs(
+                expected_values + count_sigma,
+                bin_edges,
+                baseline=expected_values - count_sigma,
+                fill=True,
+                color="tab:orange",
+                alpha=0.3,
+                label=uncertainty_label,
+            )
         counts_axis.stairs(
             expected_values,
             bin_edges,
@@ -522,10 +574,29 @@ class PlottingResiduals:
             linestyle="--",
         )
 
-        residual_axis.set_xlabel(f"{axis_name} [{axis_unit}]")
+        if axis_name == "Time":
+            if residual_type in {"pearson", "fractional"}:
+                counts_locator = mdates.AutoDateLocator()
+                counts_axis.xaxis.set_major_locator(counts_locator)
+                counts_axis.xaxis.set_major_formatter(
+                    mdates.ConciseDateFormatter(counts_locator)
+                )
+            locator = mdates.AutoDateLocator()
+            residual_axis.xaxis.set_major_locator(locator)
+            residual_axis.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+            residual_axis.set_xlabel("Time (UTC)")
+        else:
+            residual_axis.set_xlabel(f"{axis_name} [{axis_unit}]")
         residual_axis.set_ylabel(f"{residual_type.capitalize()} residual")
         if residual_type == "pearson":
-            residual_axis.set_ylim(-5.0, 5.0)
+            # Keep the nominal reference range while showing all finite points.
+            finite_values = np.asarray(residual_values, dtype=float)
+            finite_values = finite_values[np.isfinite(finite_values)]
+            lower, upper = -5.0, 5.0
+            if finite_values.size:
+                lower = min(lower, 1.1 * float(np.min(finite_values)))
+                upper = max(upper, 1.1 * float(np.max(finite_values)))
+            residual_axis.set_ylim(lower, upper)
         residual_axis.grid(alpha=0.2)
 
         if running_mean_window is not None:
@@ -574,8 +645,9 @@ class PlottingResiduals:
                     finite_residuals,
                     bins=bin_edges,
                     density=True,
-                    color="tab:blue",
-                    alpha=0.55,
+                    color=self.color,
+                    histtype="step",
+                    linewidth=2,
                     label="Observed Pearson residuals",
                 )
                 bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
@@ -600,8 +672,9 @@ class PlottingResiduals:
                     finite_residuals,
                     bins=15,
                     density=True,
-                    color="tab:blue",
-                    alpha=0.65,
+                    color=self.color,
+                    histtype="step",
+                    linewidth=2,
                     label=f"{residual_type.capitalize()} residuals",
                 )
             distribution_axis.axvline(
@@ -610,41 +683,6 @@ class PlottingResiduals:
                 linestyle=":",
                 linewidth=1,
             )
-
-            if residual_type == "pearson":
-                # Highlight the nominal three-sigma Pearson residual range.
-                residual_axis.axhspan(
-                    -3.0,
-                    3.0,
-                    color="limegreen",
-                    alpha=0.15,
-                    label=r"$\pm3\sigma$ range",
-                    zorder=0,
-                )
-
-                # Mark the one- and two-sigma levels above the shared band.
-                for level, linestyle in (
-                    (1.0, ":"),
-                    (2.0, "--"),
-                ):
-                    residual_axis.axhline(
-                        level,
-                        color="limegreen",
-                        linestyle=linestyle,
-                        linewidth=1.2,
-                        label=rf"$\pm{level:.0f}\sigma$",
-                    )
-                    residual_axis.axhline(
-                        -level,
-                        color="limegreen",
-                        linestyle=linestyle,
-                        linewidth=1.2,
-                    )
-                residual_axis.legend(
-                    loc="upper right",
-                    ncol=3,
-                    fontsize="small",
-                )
 
             if residual_type == "pearson" and show_gaussian_reference:
                 # Compare Pearson residuals with the standard normal density.
@@ -672,7 +710,6 @@ class PlottingResiduals:
             distribution_axis.grid(alpha=0.2)
 
         figure.tight_layout()
-        plt.show()
         return figure
 
     @staticmethod
@@ -780,7 +817,7 @@ class PlottingResiduals:
         map_axis.set_xlabel(f"{coordinate_name} [{coordinate_unit}]")
         map_axis.set_ylabel(f"Measured energy [{energy_unit}]")
         map_axis.set_title(
-            f"{residual_type.capitalize()} residual: Em–{coordinate_name}"
+            f"{residual_type.capitalize()} residual: Em-{coordinate_name}"
             f"{self._format_time_interval_suffix()}"
         )
         if energy_axis.axis_scale == "log":
@@ -811,8 +848,9 @@ class PlottingResiduals:
                     finite_values,
                     bins=40,
                     density=True,
-                    color="tab:blue",
-                    alpha=0.65,
+                    color=self.color,
+                    histtype="step",
+                    linewidth=2,
                     label=f"{residual_type.capitalize()} residuals",
                 )
             else:
@@ -822,8 +860,9 @@ class PlottingResiduals:
                     finite_values,
                     bins=bin_edges,
                     density=True,
-                    color="tab:blue",
-                    alpha=0.55,
+                    color=self.color,
+                    histtype="step",
+                    linewidth=2,
                     label="Observed Pearson residuals",
                 )
                 distribution_axis.stairs(
@@ -876,7 +915,6 @@ class PlottingResiduals:
             distribution_axis.grid(alpha=0.2)
 
         figure.tight_layout()
-        plt.show()
         return figure
 
     #---------------------------------------------------------------------------
@@ -912,8 +950,8 @@ class PlottingResiduals:
         # Get the two rectangular projections prepared by the analysis.
         projected_data = self.analysis.projected_data()
         projection_specs = [
-            ("Phi_Chi_projection", r"$\Phi$–$\chi$", "Chi"),
-            ("Phi_Psi_projection", r"$\Phi$–$\psi$", "Psi"),
+            ("Phi_Chi_projection", r"$\Phi$-$\chi$", "Chi"),
+            ("Phi_Psi_projection", r"$\Phi$-$\psi$", "Psi"),
         ]
 
         residual_views = []
@@ -1051,8 +1089,9 @@ class PlottingResiduals:
                         finite_values,
                         bins=bin_edges,
                         density=True,
-                        color="tab:blue",
-                        alpha=0.55,
+                        color=self.color,
+                        histtype="step",
+                        linewidth=2,
                         label="Observed Pearson residuals",
                     )
                     bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
@@ -1077,8 +1116,9 @@ class PlottingResiduals:
                         finite_values,
                         bins=40,
                         density=True,
-                        color="tab:blue",
-                        alpha=0.65,
+                        color=self.color,
+                        histtype="step",
+                        linewidth=2,
                         label=f"{residual_type.capitalize()} residuals",
                     )
                 distribution_axis.axvline(
@@ -1129,7 +1169,6 @@ class PlottingResiduals:
         )
 
         figure.tight_layout()
-        plt.show()
         return figure
 
 
@@ -1236,7 +1275,7 @@ class PlottingResiduals:
                 dtype=float,
             )
             view_label = (
-                f"for {energy_edges[energy_bin_index]:g}–"
+                f"for {energy_edges[energy_bin_index]:g}-"
                 f"{energy_edges[energy_bin_index + 1]:g} keV"
             )
         else:
@@ -1336,8 +1375,9 @@ class PlottingResiduals:
                 finite_values,
                 bins=bin_edges,
                 density=True,
-                color="tab:blue",
-                alpha=0.55,
+                color=self.color,
+                histtype="step",
+                linewidth=2,
                 label="Observed Pearson residuals",
             )
             bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
@@ -1362,8 +1402,9 @@ class PlottingResiduals:
                 finite_values,
                 bins=40,
                 density=True,
-                color="tab:blue",
-                alpha=0.65,
+                color=self.color,
+                histtype="step",
+                linewidth=2,
                 label=f"{residual_type.capitalize()} residuals",
             )
         distribution_axis.axvline(
@@ -1402,5 +1443,4 @@ class PlottingResiduals:
         distribution_axis.grid(alpha=0.2)
 
         figure.tight_layout()
-        plt.show()
         return figure
