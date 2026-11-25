@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
-from histpy import Axis, Histogram
+import healpy as hp
+from histpy import Axis, HealpixAxis, Histogram
 import astropy.units as u
 from .time_resolved_residuals_v1 import TemporalPredictionBuilder
 from .residual_statistics import build_pearson_references, residual_statistics
@@ -227,6 +228,72 @@ class ResidualAnalysis:
             time_start=time_axis.edges[time_bin_index],
             time_stop=time_axis.edges[time_bin_index + 1],
             expected_floor=self.expected_floor,
+        )
+
+    def degrade_psichi(self, nside: int) -> "ResidualAnalysis":
+        """Sum the PsiChi pixels into coarser HEALPix pixels.
+
+        Counts of the observed and expected histograms are summed over the
+        fine pixels inside each coarse pixel, so every plot and table of the
+        returned analysis works at the coarser resolution.
+
+        Args:
+            nside: Target HEALPix NSIDE, a power of two that divides the
+                current one.
+
+        Returns:
+            A new time-integrated residual analysis with the coarser PsiChi
+            axis (same scheme and frame).
+        """
+        if self._time_analysis is not None:
+            raise ValueError(
+                "degrade_psichi is available only for time-integrated analyses."
+            )
+        psichi_axis = self.observed_hist.axes["PsiChi"]
+        if (
+            isinstance(nside, bool)
+            or not isinstance(nside, (int, np.integer))
+            or nside < 1
+            or psichi_axis.nside % nside
+            or not hp.isnsideok(nside)
+        ):
+            raise ValueError(
+                f"nside must be a power of two dividing {psichi_axis.nside}."
+            )
+        children = (psichi_axis.nside // nside) ** 2
+
+        # Coarse pixels in the order of the new axis, as NESTED indices; the fine
+        # pixels inside a coarse NESTED pixel p are p * children ... (p + 1) * children - 1.
+        npix_coarse = hp.nside2npix(nside)
+        if psichi_axis.scheme == "RING":
+            coarse_nested = hp.ring2nest(nside, np.arange(npix_coarse))
+        else:
+            coarse_nested = np.arange(npix_coarse)
+        fine_index = coarse_nested[:, None] * children + np.arange(children)
+        if psichi_axis.scheme == "RING":
+            fine_index = hp.nest2ring(psichi_axis.nside, fine_index)
+
+        coarse_axis = HealpixAxis(
+            nside=nside,
+            scheme=psichi_axis.scheme,
+            coordsys=psichi_axis.coordsys,
+            label="PsiChi",
+        )
+        dimension = list(self.observed_hist.axes.labels).index("PsiChi")
+        axes = list(self.observed_hist.axes)
+        axes[dimension] = coarse_axis
+
+        def summed(histogram):
+            contents = np.asarray(histogram.to_dense().contents, dtype=float)
+            grouped = np.take(contents, fine_index, axis=dimension)
+            return Histogram(axes, contents=grouped.sum(axis=dimension + 1))
+
+        floor = None if self.expected_floor is None else self.expected_floor * children
+        return ResidualAnalysis(
+            summed(self.observed_hist),
+            summed(self.expected_hist),
+            expected_floor=floor,
+            _announce=False,
         )
 
     def mask_function(self) -> tuple[np.ndarray, dict[str, object]]:

@@ -1,6 +1,7 @@
 """Numerical tests for COSI residual analysis."""
 
 import numpy as np
+import healpy as hp
 import pytest
 import matplotlib
 matplotlib.use("Agg")
@@ -319,11 +320,12 @@ def test_pearson_plot_uses_the_same_histogram_edges_for_observed_and_reference(
         random_seed=7,
     )
     distribution_axis = figure.axes[-1]
-    observed_bars = distribution_axis.containers[0].patches
-    observed_edges = np.array(
-        [observed_bars[0].get_x()]
-        + [bar.get_x() + bar.get_width() for bar in observed_bars]
+    observed_step = next(
+        patch
+        for patch in distribution_axis.patches
+        if patch.get_label() == "Observed Pearson residuals"
     )
+    observed_edges = np.unique(observed_step.get_xy()[:, 0])   # outline histogram: x of its vertices
     simulated_step = next(
         patch
         for patch in distribution_axis.patches
@@ -1096,7 +1098,7 @@ def test_temporal_1d_plot_labels_model_and_utc_interval():
     title = figure.axes[0].get_title()
     labels = [text.get_text() for text in figure.axes[0].get_legend().get_texts()]
     assert "Time bin 5" in title
-    assert "1970-01-01 01:00:00–1970-01-01 02:00:00 UTC" in title
+    assert "1970-01-01 01:00:00-1970-01-01 02:00:00 UTC" in title
     assert r"Observed $D_{t,i}$" in labels
     assert r"Physical model $M_{t,i}$" in labels
     assert r"Poisson uncertainty ($\pm 1\sigma$)" in labels
@@ -1181,3 +1183,60 @@ def test_temporal_physical_reference_uses_poisson_after_energy_selection(monkeyp
     labels = [text.get_text() for text in figure.axes[2].get_legend().get_texts()]
     assert "Poisson MC mean density" in labels
     plt.close(figure)
+
+
+def test_plot_show_false_returns_figure_without_showing(monkeypatch):
+    """With show=False the figure is returned and plt.show is not called."""
+    calls = []
+    monkeypatch.setattr(plt, "show", lambda: calls.append(1))
+    analysis = make_poisson_reference_analysis(np.full(6, 4.0))
+    plotting = PlottingResiduals(analysis)
+    figure = plotting.plot("Phi_projection", residual_type="raw", show=False)
+    assert calls == []
+    plt.close(figure)
+    figure = plotting.plot("Phi_projection", residual_type="raw")
+    assert calls == [1]
+    plt.close(figure)
+
+
+def test_plot_label_is_written_above_the_figure(monkeypatch):
+    """The label becomes the figure title."""
+    monkeypatch.setattr(plt, "show", lambda: None)
+    analysis = make_poisson_reference_analysis(np.full(6, 4.0))
+    figure = PlottingResiduals(analysis).plot(
+        "Phi_projection", residual_type="raw", label="NF fit",
+    )
+    assert figure._suptitle.get_text() == "NF fit"
+    plt.close(figure)
+
+
+@pytest.mark.parametrize("scheme", ["RING", "NESTED"])
+def test_degrade_psichi_sums_fine_pixels_into_coarse_pixels(scheme):
+    """Coarse pixels hold the sum of their fine pixels; totals are conserved."""
+    fine_nside, coarse_nside = 4, 2
+    phi_axis = Axis([0.0, 1.0, 2.0], label="Phi", unit=u.deg)
+    fine_axis = HealpixAxis(nside=fine_nside, scheme=scheme, coordsys="galactic", label="PsiChi")
+    rng = np.random.default_rng(3)
+    expected_values = rng.uniform(1.0, 5.0, size=(2, fine_axis.npix))
+    observed_values = rng.poisson(expected_values).astype(float)
+    analysis = ResidualAnalysis(
+        Histogram([phi_axis, fine_axis], contents=observed_values),
+        Histogram([phi_axis, fine_axis], contents=expected_values),
+    )
+    coarse = analysis.degrade_psichi(coarse_nside)
+    coarse_axis = coarse.observed_hist.axes["PsiChi"]
+    assert coarse_axis.nside == coarse_nside and coarse_axis.scheme == scheme
+
+    # Reference: healpy ud_grade with power=-2 sums the fine pixels
+    nest = scheme == "NESTED"
+    for values, histogram in ((observed_values, coarse.observed_hist),
+                              (expected_values, coarse.expected_hist)):
+        reference = np.array([
+            hp.ud_grade(row, coarse_nside, power=-2, order_in=scheme, order_out=scheme)
+            for row in values
+        ])
+        np.testing.assert_allclose(histogram.contents, reference)
+        np.testing.assert_allclose(histogram.contents.sum(), values.sum())
+
+    with pytest.raises(ValueError):
+        analysis.degrade_psichi(3)
